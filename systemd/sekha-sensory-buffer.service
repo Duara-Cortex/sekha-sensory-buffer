@@ -1,0 +1,28 @@
+[Unit]
+Description=Sekha Node 3 Sensory Text Ring Buffer Daemon
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/Duara-Cortex/sekha-sensory-buffer
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+ExecStart=/usr/local/bin/sekha-sensory-buffer -host 0.0.0.0 -port 8081 -capacity-mb 64
+Restart=always
+RestartSec=3s
+
+# Resource and sandbox controls
+LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sekha-sensory-buffer
+
+# Hardening / Isolation
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
