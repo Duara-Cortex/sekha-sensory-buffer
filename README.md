@@ -146,7 +146,62 @@ Response (`200 OK`):
 
 ---
 
-### 3. Buffer Telemetry & Statistics (`GET /api/v1/sensory/stats`)
+### 3. Sensory Noise Filtering & Salience Gating (`POST /api/v1/sensory/filter`)
+
+Filters incoming text streams or queries the active buffer, suppressing boilerplate noise (>60% reduction) and retaining high-information content for working memory.
+
+#### Option A: Filter Directly From In-Memory Buffer
+```bash
+curl -X POST "http://192.168.8.183:8081/api/v1/sensory/filter?from_buffer=true&limit=50&threshold=0.45&task=detect+memory+leaks"
+```
+
+#### Option B: Filter Arbitrary Payload
+```bash
+curl -X POST http://192.168.8.183:8081/api/v1/sensory/filter \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task": "investigate thermal throttling",
+    "threshold": 0.45,
+    "include_discarded": false,
+    "items": [
+      {"origin": "syslog", "data": "ping 64 bytes from 192.168.8.1: icmp_seq=1 ttl=64 time=0.4 ms"},
+      {"origin": "dmesg", "data": "CRITICAL: thermal throttle event on SoC BCM2712 at 82.4C"}
+    ]
+  }'
+```
+
+Response (`200 OK`):
+```json
+{
+  "total_evaluated": 2,
+  "salient_count": 1,
+  "discarded_count": 1,
+  "noise_reduction_ratio": 0.5,
+  "threshold": 0.45,
+  "task_directive": "investigate thermal throttling",
+  "salient_chunks": [
+    {
+      "chunk": {
+        "seq": 2,
+        "origin": "dmesg",
+        "data": "CRITICAL: thermal throttle event on SoC BCM2712 at 82.4C"
+      },
+      "metrics": {
+        "entropy": 4.15,
+        "lexical_density": 0.78,
+        "entity_density": 0.85,
+        "task_relevance": 0.90,
+        "salience_score": 0.835,
+        "is_salient": true
+      }
+    }
+  ]
+}
+```
+
+---
+
+### 4. Buffer Telemetry & Statistics (`GET /api/v1/sensory/stats`)
 
 Returns operational health and load metrics.
 
@@ -210,11 +265,24 @@ Produces `bin/sekha-sensory-buffer-linux-arm64` and `bin/sekha-benchmark-linux-a
 
 ### Option A: Direct Git / Build on Node 3
 ```bash
-# On Node 3:
-sudo apt update && sudo apt install -y golang-go git
+# 1. On Node 3: Install base packages and official Go 1.22 (ARM64)
+sudo apt update && sudo apt install -y git make curl tar build-essential
+curl -fsSL https://go.dev/dl/go1.22.7.linux-arm64.tar.gz -o /tmp/go1.22.7.linux-arm64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf /tmp/go1.22.7.linux-arm64.tar.gz
+rm /tmp/go1.22.7.linux-arm64.tar.gz
+
+# 2. Add Go to PATH using printf (avoids heredoc/tee whitespace issues)
+sudo sh -c "printf 'export PATH=\$PATH:/usr/local/go/bin:\$HOME/go/bin\n' > /etc/profile.d/go.sh"
+printf 'export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin\n' >> ~/.bashrc
+export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
+go version
+
+# 3. Clone, build, and install
 git clone git@github.com:Duara-Cortex/sekha-sensory-buffer.git
 cd sekha-sensory-buffer
 make build
+sudo systemctl stop sekha-sensory-buffer.service 2>/dev/null || true
 sudo cp bin/sekha-sensory-buffer /usr/local/bin/
 sudo cp systemd/sekha-sensory-buffer.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -240,8 +308,7 @@ sudo systemctl enable --now sekha-sensory-buffer.service
 
 ## Load Testing & Benchmarks
 
-Run the high-speed benchmark generator against localhost or Node 3:
-
+### 1. Ingestion Load Test (10,000 lines/sec)
 ```bash
 ./bin/sekha-benchmark \
   -url http://192.168.8.183:8081/api/v1/sensory/ingest \
@@ -249,6 +316,15 @@ Run the high-speed benchmark generator against localhost or Node 3:
   -lines-per-sec 10000 \
   -duration 10s \
   -batch-size 50
+```
+
+### 2. Sensory Noise Filter Validation (Task 04)
+Evaluates classifier accuracy on synthetic mixed edge workloads (70% noise, 30% signal) and measures latency per chunk:
+```bash
+./bin/sekha-validate \
+  -url http://192.168.8.183:8081/api/v1/sensory/filter \
+  -threshold 0.45 \
+  -iterations 100
 ```
 
 ---
