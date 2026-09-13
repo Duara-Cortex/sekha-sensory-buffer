@@ -327,6 +327,16 @@ Evaluates classifier accuracy on synthetic mixed edge workloads (70% noise, 30% 
   -iterations 100
 ```
 
+### 3. Multi-Rate Subsystem Stress Test (Task 05)
+Executes a 4-tier burst sweep (100, 500, 1,000, 5,000 req/s) with concurrent active salience filtering, monitoring SoC temperatures and memory stability:
+```bash
+# On Node 3 (or from workstation pointing to Node 3):
+./bin/sekha-stress \
+  -base-url http://127.0.0.1:8081 \
+  -stage-duration 15s \
+  -concurrency 32
+```
+
 ---
 
 ## License
