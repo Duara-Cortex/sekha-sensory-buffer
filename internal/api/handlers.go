@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -37,7 +38,7 @@ type Server struct {
 func NewServer(rb *buffer.RingBuffer) *Server {
 	s := &Server{
 		RingBuffer: rb,
-		Classifier: classifier.New(0.45),
+		Classifier: classifier.New(classifier.DefaultSalienceThreshold),
 		mux:        http.NewServeMux(),
 	}
 	s.registerRoutes()
@@ -336,21 +337,44 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 // FilterRequest encapsulates payload and options for POST /api/v1/sensory/filter.
 type FilterRequest struct {
-	TaskDirective    string                `json:"task"`
-	Threshold        float64               `json:"threshold"`
-	IncludeDiscarded bool                  `json:"include_discarded"`
-	FromBuffer       bool                  `json:"from_buffer"`
-	Limit            int                   `json:"limit"`
-	SinceMs          int64                 `json:"since_ms"`
-	SinceSeq         uint64                `json:"since_seq"`
-	Items            []SingleIngestRequest `json:"items"`
+	Task             string                `json:"task,omitempty"`
+	TaskDirective    string                `json:"task_directive,omitempty"`
+	Threshold        float64               `json:"threshold,omitempty"`
+	ChunkBy          string                `json:"chunk_by,omitempty"`
+	MaxChunkSize     int                   `json:"max_chunk_size,omitempty"`
+	MaxTokens        int                   `json:"max_tokens,omitempty"`
+	IncludeDiscarded bool                  `json:"include_discarded,omitempty"`
+	FromBuffer       bool                  `json:"from_buffer,omitempty"`
+	Limit            int                   `json:"limit,omitempty"`
+	SinceMs          int64                 `json:"since_ms,omitempty"`
+	SinceSeq         uint64                `json:"since_seq,omitempty"`
+	Text             string                `json:"text,omitempty"`
+	Data             string                `json:"data,omitempty"`
+	Payload          string                `json:"payload,omitempty"`
+	Items            []SingleIngestRequest `json:"items,omitempty"`
+}
+
+// ExtractText retrieves the raw stream text from any supported JSON text field.
+func (r *FilterRequest) ExtractText() string {
+	if r.Text != "" {
+		return r.Text
+	}
+	if r.Data != "" {
+		return r.Data
+	}
+	return r.Payload
 }
 
 // handleFilter implements POST /api/v1/sensory/filter for attention-gating noise reduction.
 func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
 	q := r.URL.Query()
 
 	task := q.Get("task")
+	if task == "" {
+		task = q.Get("task_directive")
+	}
+
 	threshold := s.Classifier.DefaultThreshold
 	if thStr := q.Get("threshold"); thStr != "" {
 		if parsed, err := strconv.ParseFloat(thStr, 64); err == nil && parsed > 0 && parsed < 1.0 {
@@ -359,6 +383,19 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 	}
 	includeDiscarded := q.Get("include_discarded") == "true"
 	fromBuffer := q.Get("from_buffer") == "true"
+
+	chunkBy := q.Get("chunk_by")
+	maxChunkBytes := 4096
+	if szStr := q.Get("max_chunk_size"); szStr != "" {
+		if parsed, err := strconv.Atoi(szStr); err == nil && parsed > 0 {
+			maxChunkBytes = parsed
+		}
+	}
+	if tokStr := q.Get("max_tokens"); tokStr != "" {
+		if parsed, err := strconv.Atoi(tokStr); err == nil && parsed > 0 {
+			maxChunkBytes = parsed * 4
+		}
+	}
 
 	limit := 100
 	if limitStr := q.Get("limit"); limitStr != "" {
@@ -386,16 +423,48 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 	if fromBuffer {
 		chunksToFilter = s.RingBuffer.Query(limit, sinceMs, sinceSeq)
 	} else {
-		// Read body
-		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
-		if err == nil && len(bytes.TrimSpace(bodyBytes)) > 0 {
+		// Body limit: support up to 16MB payloads (well above 500KB requirement)
+		const maxBodyLimit = 16 * 1024 * 1024
+		if r.ContentLength > maxBodyLimit {
+			http.Error(w, `{"error": "payload too large, maximum size is 16MB"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+
+		// MaxBytesReader rejects oversized bodies sent without Content-Length (chunked
+		// transfer) instead of silently truncating them into unparseable JSON.
+		bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyLimit))
+		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				http.Error(w, `{"error": "payload too large, maximum size is 16MB"}`, http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, `{"error": "failed to read body: `+err.Error()+`"}`, http.StatusBadRequest)
+			return
+		}
+
+		trimmedBody := bytes.TrimSpace(bodyBytes)
+		if len(trimmedBody) > 0 {
+			// 1. Try parsing structured FilterRequest JSON
 			var filterReq FilterRequest
 			if err := json.Unmarshal(bodyBytes, &filterReq); err == nil {
 				if filterReq.TaskDirective != "" && task == "" {
 					task = filterReq.TaskDirective
 				}
+				if filterReq.Task != "" && task == "" {
+					task = filterReq.Task
+				}
 				if filterReq.Threshold > 0 && filterReq.Threshold < 1.0 && q.Get("threshold") == "" {
 					threshold = filterReq.Threshold
+				}
+				if filterReq.ChunkBy != "" && chunkBy == "" {
+					chunkBy = filterReq.ChunkBy
+				}
+				if filterReq.MaxChunkSize > 0 && q.Get("max_chunk_size") == "" {
+					maxChunkBytes = filterReq.MaxChunkSize
+				}
+				if filterReq.MaxTokens > 0 && q.Get("max_tokens") == "" {
+					maxChunkBytes = filterReq.MaxTokens * 4
 				}
 				if filterReq.IncludeDiscarded {
 					includeDiscarded = true
@@ -416,13 +485,48 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 							Data:      it.ExtractData(),
 						})
 					}
+				} else if streamText := filterReq.ExtractText(); streamText != "" {
+					// Dynamic stream partitioning of inline text in JSON payload
+					parseOpts := parser.Options{ChunkBy: chunkBy, MaxChunkBytes: maxChunkBytes}
+					parsedChunks, pErr := parser.ParseTXT([]byte(streamText), parseOpts)
+					if pErr == nil {
+						for i, text := range parsedChunks {
+							chunksToFilter = append(chunksToFilter, buffer.Chunk{
+								Seq:       uint64(i + 1),
+								Timestamp: time.Now().UTC(),
+								Origin:    "filter_stream",
+								Data:      text,
+							})
+						}
+					}
 				}
 			}
 
-			// If not parsed as FilterRequest or no items found, parse as raw document/stream
+			// 2. Try parsing as JSON array of items: [{"origin": "...", "data": "..."}]
 			if len(chunksToFilter) == 0 {
-				parsedChunks, err := parser.Parse(parser.DetectFormat("", r.Header.Get("Content-Type"), bodyBytes), bytes.NewReader(bodyBytes), parser.DefaultOptions())
-				if err == nil {
+				var arrayReq []SingleIngestRequest
+				if err := json.Unmarshal(bodyBytes, &arrayReq); err == nil && len(arrayReq) > 0 {
+					for i, it := range arrayReq {
+						origin := it.Origin
+						if origin == "" {
+							origin = "filter_stream"
+						}
+						chunksToFilter = append(chunksToFilter, buffer.Chunk{
+							Seq:       uint64(i + 1),
+							Timestamp: time.Now().UTC(),
+							Origin:    origin,
+							Data:      it.ExtractData(),
+						})
+					}
+				}
+			}
+
+			// 3. Fallback: Parse directly as raw document or plain text multi-line stream
+			if len(chunksToFilter) == 0 {
+				parseOpts := parser.Options{ChunkBy: chunkBy, MaxChunkBytes: maxChunkBytes}
+				detectedFormat := parser.DetectFormat("", r.Header.Get("Content-Type"), bodyBytes)
+				parsedChunks, pErr := parser.Parse(detectedFormat, bytes.NewReader(bodyBytes), parseOpts)
+				if pErr == nil {
 					for i, text := range parsedChunks {
 						chunksToFilter = append(chunksToFilter, buffer.Chunk{
 							Seq:       uint64(i + 1),
@@ -436,10 +540,49 @@ func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	chunksToFilter = partitionOversizedChunks(chunksToFilter, parser.Options{ChunkBy: chunkBy, MaxChunkBytes: maxChunkBytes})
+
 	result := s.Classifier.FilterChunks(chunksToFilter, task, threshold, includeDiscarded)
+	result.LatencyMS = float64(time.Since(startTime).Microseconds()) / 1000.0
 	s.recordClassifierMetrics(result.TotalEvaluated, result.SalientCount, result.DiscardedCount)
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// partitionOversizedChunks splits any chunk larger than opts.MaxChunkBytes at line/paragraph
+// boundaries so that items, buffer windows and non-text formats are gated per chunk rather than
+// as a single monolithic block. Chunks within the limit keep their caller-supplied boundaries.
+// Sequence numbers are reassigned when splitting occurs so chunk IDs remain unique.
+func partitionOversizedChunks(chunks []buffer.Chunk, opts parser.Options) []buffer.Chunk {
+	if opts.MaxChunkBytes <= 0 {
+		return chunks
+	}
+	split := false
+	out := make([]buffer.Chunk, 0, len(chunks))
+	for _, c := range chunks {
+		if len(c.Data) <= opts.MaxChunkBytes {
+			out = append(out, c)
+			continue
+		}
+		parts, err := parser.ParseTXT([]byte(c.Data), opts)
+		if err != nil || len(parts) == 0 {
+			out = append(out, c)
+			continue
+		}
+		split = true
+		for _, part := range parts {
+			sub := c
+			sub.Data = part
+			sub.SizeBytes = int64(len(part))
+			out = append(out, sub)
+		}
+	}
+	if split {
+		for i := range out {
+			out[i].Seq = uint64(i + 1)
+		}
+	}
+	return out
 }
 
 // BufferQueryResponse formats output for GET /api/v1/sensory/buffer.

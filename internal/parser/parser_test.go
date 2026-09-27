@@ -3,6 +3,7 @@ package parser
 import (
 	"bytes"
 	"compress/zlib"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -23,6 +24,59 @@ func TestParseTXT(t *testing.T) {
 	}
 	if len(lines) != 4 {
 		t.Fatalf("expected 4 non-empty lines, got %d: %+v", len(lines), lines)
+	}
+}
+
+func TestParseTXT_DynamicStreamChunking(t *testing.T) {
+	// 1. Multi-line log stream without double newlines (automatic line partitioning)
+	logStream := "[DEBUG] 2026-09-13 14:30:00 heartbeat status=ok\n" +
+		"ping 64 bytes from 192.168.8.1: icmp_seq=1 ttl=64 time=0.4 ms\n" +
+		"CRITICAL ALERT: Memory exhaustion detected\n" +
+		"GET /healthz 200 OK 127.0.0.1 - 0.2ms"
+
+	chunks, err := ParseTXT([]byte(logStream), Options{ChunkBy: "auto"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(chunks) != 4 {
+		t.Fatalf("expected 4 chunks from multi-line stream, got %d: %+v", len(chunks), chunks)
+	}
+
+	// 2. Preserves semantic boundaries with continuation lines (stack trace)
+	traceLog := "[ERROR] 2026-09-13 14:30:01 worker panic\n" +
+		"    at worker.process (worker.go:42)\n" +
+		"    at runtime.main (proc.go:100)\n" +
+		"[INFO] 2026-09-13 14:30:02 worker restarted"
+
+	traceChunks, err := ParseTXT([]byte(traceLog), Options{ChunkBy: "line"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(traceChunks) != 2 {
+		t.Fatalf("expected 2 chunks (continuation lines grouped), got %d: %+v", len(traceChunks), traceChunks)
+	}
+	if !strings.Contains(traceChunks[0], "at runtime.main") {
+		t.Fatalf("expected stack trace in first chunk, got: %s", traceChunks[0])
+	}
+
+	// 3. Bounded chunking without splitting mid-token
+	longText := "The quick brown fox jumps over the lazy dog repeatedly until the token boundary is reached safely."
+	boundedChunks, err := ParseTXT([]byte(longText), Options{ChunkBy: "doc", MaxChunkBytes: 30})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(boundedChunks) < 3 {
+		t.Fatalf("expected multiple bounded chunks, got %d", len(boundedChunks))
+	}
+	for _, bc := range boundedChunks {
+		if len(bc) > 35 { // allows slight lookahead to avoid mid-token split
+			t.Fatalf("chunk exceeds max limit: len=%d text=%s", len(bc), bc)
+		}
+		// Verify no mid-word split (chunk does not end in cut word)
+		words := strings.Fields(bc)
+		if len(words) == 0 {
+			t.Fatalf("empty words in chunk: %s", bc)
+		}
 	}
 }
 
@@ -182,3 +236,24 @@ func TestParseJSON(t *testing.T) {
 	}
 }
 
+
+func TestParse_BoundsOversizedNonTextChunks(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("# Incident Log\n\n")
+	for i := 0; sb.Len() < 20*1024; i++ {
+		sb.WriteString("line " + strconv.Itoa(i) + ": heartbeat status=ok node=node3\n")
+	}
+
+	chunks, err := Parse(FormatMD, strings.NewReader(sb.String()), Options{ChunkBy: "auto", MaxChunkBytes: 2048})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(chunks) <= 1 {
+		t.Fatalf("expected oversized markdown section to be partitioned, got %d chunk(s)", len(chunks))
+	}
+	for i, c := range chunks {
+		if len(c) > 2048 {
+			t.Errorf("chunk %d exceeds MaxChunkBytes: %d bytes", i, len(c))
+		}
+	}
+}

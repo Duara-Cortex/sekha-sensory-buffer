@@ -1,9 +1,11 @@
 package classifier
 
 import (
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/buffer"
@@ -40,33 +42,59 @@ type SalienceMetrics struct {
 	DiscardReason      string  `json:"discard_reason,omitempty"`
 }
 
-// FilteredChunk wraps a buffer.Chunk with its salience metrics.
+// SensoryChunk represents a discrete, scored text payload evaluated by the attention gate.
+type SensoryChunk struct {
+	ID        string    `json:"id"`
+	Text      string    `json:"text"`
+	Salience  float64   `json:"salience"`
+	Source    string    `json:"source,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// FilteredChunk wraps a buffer.Chunk with its salience metrics and consumer-friendly fields.
 type FilteredChunk struct {
-	Chunk   buffer.Chunk    `json:"chunk"`
-	Metrics SalienceMetrics `json:"metrics"`
+	Chunk    buffer.Chunk    `json:"chunk"`
+	Metrics  SalienceMetrics `json:"metrics"`
+	ID       string          `json:"id,omitempty"`
+	Text     string          `json:"text,omitempty"`
+	Salience float64         `json:"salience"`
+	Source   string          `json:"source,omitempty"`
 }
 
 // FilterResult represents the outcome of filtering a batch or window of text chunks.
 type FilterResult struct {
-	TotalEvaluated      int             `json:"total_evaluated"`
-	SalientCount        int             `json:"salient_count"`
-	DiscardedCount      int             `json:"discarded_count"`
-	NoiseReductionRatio float64         `json:"noise_reduction_ratio"`
-	Threshold           float64         `json:"threshold"`
-	TaskDirective       string          `json:"task_directive,omitempty"`
-	SalientChunks       []FilteredChunk `json:"salient_chunks"`
-	DiscardedChunks     []FilteredChunk `json:"discarded_chunks,omitempty"`
+	// Standard response contract
+	TotalChunks    int            `json:"total_chunks"`
+	NoiseDiscarded int            `json:"noise_discarded"`
+	ReductionRate  float64        `json:"reduction_rate"`
+	Chunks         []SensoryChunk `json:"chunks"`
+
+	// Detailed chunk lists
+	SalientChunks   []FilteredChunk `json:"salient_chunks"`
+	DiscardedChunks []FilteredChunk `json:"discarded_chunks,omitempty"`
+
+	// Backward-compatible native fields
+	TotalEvaluated      int     `json:"total_evaluated"`
+	SalientCount        int     `json:"salient_count"`
+	DiscardedCount      int     `json:"discarded_count"`
+	NoiseReductionRatio float64 `json:"noise_reduction_ratio"`
+	Threshold           float64 `json:"threshold"`
+	TaskDirective       string  `json:"task_directive,omitempty"`
+	LatencyMS           float64 `json:"latency_ms,omitempty"`
 }
+
+// DefaultSalienceThreshold is the standard attention gating threshold for Node 3.
+const DefaultSalienceThreshold = 0.75
 
 // Classifier implements CPU-efficient information-density and semantic salience gating.
 type Classifier struct {
 	DefaultThreshold float64
 }
 
-// New creates a new Classifier with a given default threshold (e.g. 0.45).
+// New creates a new Classifier with a given default threshold (e.g. 0.75).
 func New(defaultThreshold float64) *Classifier {
 	if defaultThreshold <= 0.0 || defaultThreshold >= 1.0 {
-		defaultThreshold = 0.45
+		defaultThreshold = DefaultSalienceThreshold
 	}
 	return &Classifier{
 		DefaultThreshold: defaultThreshold,
@@ -181,7 +209,8 @@ func (c *Classifier) Score(text string, taskDirective string, threshold float64)
 
 	actionableBoost := 0.0
 	if isActionable {
-		actionableBoost = 0.25
+		actionableBoost = 0.30
+		repetitionPenalty = 0.0
 	}
 
 	proseBoost := 0.0
@@ -191,7 +220,7 @@ func (c *Classifier) Score(text string, taskDirective string, threshold float64)
 
 	boilerplatePenalty := 0.0
 	if isBoilerplate && !isActionable {
-		boilerplatePenalty = 0.40
+		boilerplatePenalty = 0.60
 	}
 
 	// 6. Task Directive Relevance
@@ -278,18 +307,43 @@ func (c *Classifier) FilterChunks(chunks []buffer.Chunk, taskDirective string, t
 		threshold = c.DefaultThreshold
 	}
 
-	var salient []FilteredChunk
-	var discarded []FilteredChunk
+	salient := make([]FilteredChunk, 0)
+	discarded := make([]FilteredChunk, 0)
+	survivingSensory := make([]SensoryChunk, 0)
 
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
 		metrics := c.Score(chunk.Data, taskDirective, threshold)
+		chunkID := fmt.Sprintf("chnk-%03d", chunk.Seq)
+		if chunk.Seq == 0 {
+			chunkID = fmt.Sprintf("chnk-%03d", i+1)
+		}
+		source := chunk.Origin
+		if source == "" {
+			source = "filter_stream"
+		}
+		ts := chunk.Timestamp
+		if ts.IsZero() {
+			ts = time.Now().UTC()
+		}
+
 		fc := FilteredChunk{
-			Chunk:   chunk,
-			Metrics: metrics,
+			Chunk:    chunk,
+			Metrics:  metrics,
+			ID:       chunkID,
+			Text:     chunk.Data,
+			Salience: metrics.SalienceScore,
+			Source:   source,
 		}
 
 		if metrics.IsSalient {
 			salient = append(salient, fc)
+			survivingSensory = append(survivingSensory, SensoryChunk{
+				ID:        chunkID,
+				Text:      chunk.Data,
+				Salience:  metrics.SalienceScore,
+				Source:    source,
+				Timestamp: ts,
+			})
 		} else {
 			if includeDiscarded {
 				discarded = append(discarded, fc)
@@ -305,14 +359,18 @@ func (c *Classifier) FilterChunks(chunks []buffer.Chunk, taskDirective string, t
 	}
 
 	return FilterResult{
+		TotalChunks:         total,
+		NoiseDiscarded:      discardedCount,
+		ReductionRate:       math.Round(noiseReductionRatio*1000) / 1000,
+		Chunks:              survivingSensory,
+		SalientChunks:       salient,
+		DiscardedChunks:     discarded,
 		TotalEvaluated:      total,
 		SalientCount:        len(salient),
 		DiscardedCount:      discardedCount,
 		NoiseReductionRatio: math.Round(noiseReductionRatio*1000) / 1000,
 		Threshold:           threshold,
 		TaskDirective:       taskDirective,
-		SalientChunks:       salient,
-		DiscardedChunks:     discarded,
 	}
 }
 
@@ -356,19 +414,19 @@ func hasRepeatedRunes(s string, minRepeats int) bool {
 }
 
 func isBoilerplateLog(lower string) bool {
-	if strings.Contains(lower, "ping ") && strings.Contains(lower, "icmp_seq=") {
+	if strings.Contains(lower, "ping ") && (strings.Contains(lower, "icmp_seq=") || strings.Contains(lower, "bytes from") || strings.Contains(lower, "ttl=")) {
 		return true
 	}
-	if strings.Contains(lower, "heartbeat") && (strings.Contains(lower, "status=ok") || strings.Contains(lower, "load=")) {
+	if strings.Contains(lower, "heartbeat") && (strings.Contains(lower, "status=ok") || strings.Contains(lower, "load=") || strings.Contains(lower, "probe") || strings.Contains(lower, "seq=")) {
 		return true
 	}
-	if (strings.Contains(lower, "get /health") || strings.Contains(lower, "/healthz") || strings.Contains(lower, "get /metrics")) && strings.Contains(lower, "200") {
+	if (strings.Contains(lower, "get /health") || strings.Contains(lower, "/healthz") || strings.Contains(lower, "get /metrics")) && (strings.Contains(lower, "200") || strings.Contains(lower, "ok")) {
 		return true
 	}
 	if strings.Contains(lower, "link up") && strings.Contains(lower, "full-duplex") {
 		return true
 	}
-	if strings.HasPrefix(lower, "[debug]") && (strings.Contains(lower, "probe") || strings.Contains(lower, "ping") || strings.Contains(lower, "ok")) {
+	if strings.HasPrefix(lower, "[debug]") && (strings.Contains(lower, "probe") || strings.Contains(lower, "ping") || strings.Contains(lower, "ok") || strings.Contains(lower, "heartbeat") || strings.Contains(lower, "status=")) {
 		return true
 	}
 	return false
@@ -378,6 +436,7 @@ func isActionableAlert(upper string) bool {
 	alertKeywords := []string{
 		"CRITICAL", "ALERT", "ERROR", "PANIC", "FATAL", "WARNING",
 		"EXCEPTION", "FAIL", "FAILURE", "OOM", "TASK DIRECTIVE", "INSTRUCTION",
+		"THROTTLE", "THROTTLING",
 	}
 	for _, kw := range alertKeywords {
 		if strings.Contains(upper, kw) {

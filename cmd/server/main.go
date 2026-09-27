@@ -56,8 +56,10 @@ func main() {
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           server,
-		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Channel to listen for interrupt or termination signals
