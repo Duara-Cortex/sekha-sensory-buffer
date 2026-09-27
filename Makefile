@@ -1,4 +1,4 @@
-.PHONY: all build build-arm64 test clean run bench
+.PHONY: all build build-arm64 install test validate stress clean run bench
 
 BINARY_NAME=sekha-sensory-buffer
 BENCHMARK_NAME=sekha-benchmark
@@ -25,12 +25,15 @@ build-arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o bin/$(STRESS_NAME)-linux-arm64 ./cmd/stress_test
 	@echo "Cross-compiled ARM64 binaries in bin/"
 
-install: build
-	sudo systemctl stop sekha-sensory-buffer.service 2>/dev/null || true
-	sudo cp bin/$(BINARY_NAME) /usr/local/bin/
-	sudo cp systemd/sekha-sensory-buffer.service /etc/systemd/system/
-	sudo systemctl daemon-reload
-	sudo systemctl restart sekha-sensory-buffer.service
+# Run as: make build && sudo make install
+install:
+	@test -f bin/$(BINARY_NAME) || { echo "bin/$(BINARY_NAME) not found; run 'make build' first"; exit 1; }
+	@test "$$(id -u)" -eq 0 || { echo "install must be run as root: sudo make install"; exit 1; }
+	systemctl stop sekha-sensory-buffer.service 2>/dev/null || true
+	cp bin/$(BINARY_NAME) /usr/local/bin/
+	cp systemd/sekha-sensory-buffer.service /etc/systemd/system/
+	systemctl daemon-reload
+	systemctl restart sekha-sensory-buffer.service
 	@echo "Daemon updated and restarted: sekha-sensory-buffer.service"
 
 test:

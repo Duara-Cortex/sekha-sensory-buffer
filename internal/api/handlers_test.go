@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/json"
+	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/buffer"
 )
@@ -361,3 +364,318 @@ func TestHandleHealth(t *testing.T) {
 	}
 }
 
+func TestHandleFilter_DynamicStreamChunking_RawText(t *testing.T) {
+	srv := setupTestServer()
+
+	rawLog := "ping 64 bytes from 192.168.8.1: icmp_seq=1 ttl=64 time=0.4 ms\n" +
+		"[DEBUG] 2026-09-13 13:40:00 heartbeat status=ok\n" +
+		"GET /healthz 200 OK 127.0.0.1 - 0.2ms\n" +
+		"CRITICAL ALERT: Working memory heap utilization on sekha-node2 exceeded 90% (14.6GB / 16.0GB).\n" +
+		"--------------------------------------------------\n" +
+		"Host sekha-node2 reported thermal throttling at 82C with memory exhaustion in working memory scratchpad."
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter?task=cluster+health", strings.NewReader(rawLog))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	totalChunks := int(res["total_chunks"].(float64))
+	noiseDiscarded := int(res["noise_discarded"].(float64))
+	reductionRate := res["reduction_rate"].(float64)
+	salientCount := int(res["salient_count"].(float64))
+
+	if totalChunks <= 1 {
+		t.Fatalf("expected total_chunks > 1, got %d (stream was not dynamically partitioned)", totalChunks)
+	}
+	if noiseDiscarded == 0 {
+		t.Fatalf("expected noise_discarded > 0, got %d", noiseDiscarded)
+	}
+	if reductionRate <= 0.0 {
+		t.Fatalf("expected reduction_rate > 0, got %f", reductionRate)
+	}
+	if salientCount < 2 {
+		t.Fatalf("expected at least 2 salient chunks preserved, got %d", salientCount)
+	}
+
+	// Verify chunks list in response contract
+	chunksList, ok := res["chunks"].([]interface{})
+	if !ok || len(chunksList) != salientCount {
+		t.Fatalf("expected 'chunks' array with length %d, got %+v", salientCount, res["chunks"])
+	}
+}
+
+func TestHandleFilter_DynamicStreamChunking_JSONText(t *testing.T) {
+	srv := setupTestServer()
+
+	body := map[string]interface{}{
+		"text": "[DEBUG] heartbeat probe seq=1 status=ok\n" +
+			"[DEBUG] heartbeat probe seq=2 status=ok\n" +
+			"CRITICAL ALERT: BCM2712 SoC on Node 3 reached 82.4°C\n" +
+			"ping 64 bytes from 192.168.8.1: icmp_seq=1 ttl=64 time=0.4 ms",
+		"task_directive": "thermal alerts",
+		"threshold":      0.75,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if int(res["total_chunks"].(float64)) != 4 {
+		t.Fatalf("expected 4 total_chunks, got %v", res["total_chunks"])
+	}
+	if int(res["noise_discarded"].(float64)) != 3 {
+		t.Fatalf("expected 3 noise_discarded, got %v", res["noise_discarded"])
+	}
+	if int(res["salient_count"].(float64)) != 1 {
+		t.Fatalf("expected 1 salient_count, got %v", res["salient_count"])
+	}
+	if res["reduction_rate"].(float64) < 0.70 {
+		t.Fatalf("expected reduction_rate >= 0.70, got %v", res["reduction_rate"])
+	}
+}
+
+func TestHandleFilter_90KB_NoisyLogWithPlantedSignal(t *testing.T) {
+	srv := setupTestServer()
+
+	// Build a realistic ~90 KB+ log with ~1,500 lines of noise and 5 planted signal events
+	var sb strings.Builder
+	plantedSignals := []string{
+		"CRITICAL ALERT: Working memory heap utilization on sekha-node2 exceeded 90% (14.6GB / 16.0GB). SLM context window compression activated.",
+		"Fatal error: kernel panic on node 3 - unable to handle kernel paging request at virtual address 0000000000000010.",
+		"TASK DIRECTIVE: Query long-term relational knowledge graph on Node 1 for historical decisions regarding cluster power capping.",
+		"Thermal Warning: BCM2712 SoC on Node 3 reached 78.4°C. Active cooler fan RPM scaled to 100%.",
+		"Host sekha-node2 reported thermal throttling at 82C with memory exhaustion in working memory scratchpad.",
+	}
+
+	signalInterval := 250
+	totalNoiseLines := 1500
+
+	for i := 0; i < totalNoiseLines; i++ {
+		if i > 0 && i%signalInterval == 0 && (i/signalInterval)-1 < len(plantedSignals) {
+			sig := plantedSignals[(i/signalInterval)-1]
+			sb.WriteString(sig + "\n")
+		}
+
+		// Noise patterns
+		switch i % 5 {
+		case 0:
+			sb.WriteString(fmt.Sprintf("ping 64 bytes from 192.168.8.1: icmp_seq=%d ttl=64 time=0.421 ms\n", i))
+		case 1:
+			sb.WriteString(fmt.Sprintf("[DEBUG] 2026-09-13 14:30:%02d heartbeat status=ok node=node3 load=0.08\n", i%60))
+		case 2:
+			sb.WriteString(fmt.Sprintf("GET /healthz 200 OK 127.0.0.1 - 180µs request_id=%06d\n", i))
+		case 3:
+			sb.WriteString("kernel: [ 102.481920] eth0: link up, 1000Mbps, full-duplex\n")
+		case 4:
+			sb.WriteString("--------------------------------------------------------------------------------\n")
+		}
+	}
+
+	payload := sb.String()
+	payloadSizeKB := float64(len(payload)) / 1024.0
+	if payloadSizeKB < 80.0 {
+		t.Fatalf("payload size too small for 90KB test: %.1f KB", payloadSizeKB)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter?task=monitor+thermal+and+memory+leaks", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d. Body: %s", rec.Code, rec.Body.String())
+	}
+
+	var res map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	totalChunks := int(res["total_chunks"].(float64))
+	noiseDiscarded := int(res["noise_discarded"].(float64))
+	reductionRate := res["reduction_rate"].(float64)
+	salientCount := int(res["salient_count"].(float64))
+
+	// Verify empirical gating criteria
+	if totalChunks <= 1 {
+		t.Fatalf("expected total_chunks > 1, got %d", totalChunks)
+	}
+	if noiseDiscarded <= 0 {
+		t.Fatalf("expected noise_discarded > 0, got %d", noiseDiscarded)
+	}
+	if reductionRate < 0.90 {
+		t.Fatalf("expected reduction_rate >= 0.90 for noisy log, got %f", reductionRate)
+	}
+	if salientCount < len(plantedSignals) {
+		t.Fatalf("expected all %d planted signals to be preserved, but got %d", len(plantedSignals), salientCount)
+	}
+
+	// Verify all planted signals are present in surviving chunks
+	survivingChunks, ok := res["chunks"].([]interface{})
+	if !ok {
+		t.Fatalf("missing or invalid 'chunks' in response: %+v", res)
+	}
+
+	var survivingTexts []string
+	for _, sc := range survivingChunks {
+		chunkMap := sc.(map[string]interface{})
+		survivingTexts = append(survivingTexts, chunkMap["text"].(string))
+	}
+
+	for _, expectedSig := range plantedSignals {
+		found := false
+		for _, st := range survivingTexts {
+			if strings.Contains(st, expectedSig) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("planted signal line lost during filtering: %s", expectedSig)
+		}
+	}
+}
+
+func TestHandleFilter_LargePayload_250KB_and_500KB(t *testing.T) {
+	srv := setupTestServer()
+
+	sizes := []int{250 * 1024, 500 * 1024}
+
+	for _, targetBytes := range sizes {
+		var sb strings.Builder
+		lineIdx := 0
+		for sb.Len() < targetBytes {
+			sb.WriteString(fmt.Sprintf("[DEBUG] 2026-09-13 14:30:00 node=node3 sensor_event_%05d status=ok metric=ping_stat_val time=0.4ms\n", lineIdx))
+			lineIdx++
+		}
+		// Plant a critical alert
+		sb.WriteString("CRITICAL ALERT: High temperature threshold breached on BCM2712 SoC\n")
+
+		payload := sb.String()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter?task=thermal+alert", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "text/plain")
+		rec := httptest.NewRecorder()
+
+		start := time.Now()
+		srv.ServeHTTP(rec, req)
+		elapsed := time.Since(start)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 for %d KB payload, got %d. Body: %s", targetBytes/1024, rec.Code, rec.Body.String())
+		}
+
+		var res map[string]interface{}
+		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+			t.Fatalf("failed to decode response: %v", err)
+		}
+
+		totalChunks := int(res["total_chunks"].(float64))
+		if totalChunks <= 1 {
+			t.Fatalf("expected total_chunks > 1 for %d KB payload, got %d", targetBytes/1024, totalChunks)
+		}
+		if res["reduction_rate"].(float64) < 0.95 {
+			t.Fatalf("expected reduction_rate >= 0.95, got %v", res["reduction_rate"])
+		}
+
+		// Latency check: should complete well under 2 seconds even for 500KB
+		if elapsed > 2*time.Second {
+			t.Fatalf("processing time too slow for %d KB payload: %v", targetBytes/1024, elapsed)
+		}
+	}
+}
+
+
+func TestHandleFilter_OversizedItemIsPartitioned(t *testing.T) {
+	srv := setupTestServer()
+
+	var sb strings.Builder
+	for i := 0; sb.Len() < 90*1024; i++ {
+		sb.WriteString(fmt.Sprintf("[DEBUG] 2026-09-13 14:30:%02d heartbeat status=ok node=node3 load=0.08\n", i%60))
+		if i == 400 {
+			sb.WriteString("CRITICAL ALERT: Working memory heap utilization on sekha-node2 exceeded 90% (14.6GB / 16.0GB).\n")
+		}
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"task":  "monitor memory",
+		"items": []map[string]string{{"origin": "syslog", "data": sb.String()}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var res struct {
+		TotalChunks    int     `json:"total_chunks"`
+		NoiseDiscarded int     `json:"noise_discarded"`
+		ReductionRate  float64 `json:"reduction_rate"`
+		Chunks         []struct {
+			ID     string `json:"id"`
+			Text   string `json:"text"`
+			Source string `json:"source"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if res.TotalChunks <= 1 || res.NoiseDiscarded <= 0 || res.ReductionRate <= 0 {
+		t.Fatalf("expected oversized item to be partitioned and gated, got total=%d discarded=%d rate=%f",
+			res.TotalChunks, res.NoiseDiscarded, res.ReductionRate)
+	}
+
+	found := false
+	for _, c := range res.Chunks {
+		if c.Source != "syslog" {
+			t.Errorf("expected partitioned chunk to keep origin 'syslog', got %q", c.Source)
+		}
+		if strings.Contains(c.Text, "CRITICAL ALERT") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("planted signal was not preserved in surviving chunks")
+	}
+}
+
+func TestHandleFilter_OversizedChunkedBodyRejected(t *testing.T) {
+	srv := setupTestServer()
+
+	// Hide the length so the request looks like a chunked transfer with no Content-Length.
+	body := struct{ io.Reader }{bytes.NewReader(bytes.Repeat([]byte("a"), 16*1024*1024+1))}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sensory/filter", body)
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized chunked body, got %d", rec.Code)
+	}
+}

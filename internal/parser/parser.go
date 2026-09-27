@@ -22,8 +22,10 @@ const (
 
 // Options specifies how documents should be chunked and parsed.
 type Options struct {
-	// ChunkBy: "doc" (whole document), "para" (paragraphs), "line" (lines), "section" (headers in MD)
+	// ChunkBy: "doc" (whole document), "para" (paragraphs), "line" (lines), "section" (headers in MD), "auto"
 	ChunkBy string
+	// MaxChunkBytes: maximum bytes/chars per chunk before splitting at semantic boundaries (default: 4096)
+	MaxChunkBytes int
 	// HeaderPrefix for CSV: whether to prefix values with column names (e.g. "col: val | col2: val2")
 	CSVWithHeaders bool
 }
@@ -32,6 +34,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		ChunkBy:        "auto",
+		MaxChunkBytes:  4096,
 		CSVWithHeaders: true,
 	}
 }
@@ -97,20 +100,47 @@ func Parse(format Format, r io.Reader, opts Options) ([]string, error) {
 		return nil, err
 	}
 
+	var chunks []string
 	switch format {
 	case FormatTXT:
 		return ParseTXT(data, opts)
 	case FormatMD:
-		return ParseMarkdown(data, opts)
+		chunks, err = ParseMarkdown(data, opts)
 	case FormatCSV:
-		return ParseCSV(data, opts)
+		chunks, err = ParseCSV(data, opts)
 	case FormatXML:
-		return ParseXML(data, opts)
+		chunks, err = ParseXML(data, opts)
 	case FormatPDF:
-		return ParsePDF(data, opts)
+		chunks, err = ParsePDF(data, opts)
 	case FormatJSON:
-		return ParseJSON(data, opts)
+		chunks, err = ParseJSON(data, opts)
 	default:
 		return ParseTXT(data, opts)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return boundChunks(chunks, opts), nil
+}
+
+// boundChunks re-partitions any chunk exceeding opts.MaxChunkBytes at line/paragraph
+// boundaries, so format-specific parsers never emit a single oversized block.
+func boundChunks(chunks []string, opts Options) []string {
+	if opts.MaxChunkBytes <= 0 {
+		return chunks
+	}
+	out := make([]string, 0, len(chunks))
+	for _, c := range chunks {
+		if len(c) <= opts.MaxChunkBytes {
+			out = append(out, c)
+			continue
+		}
+		parts, _ := ParseTXT([]byte(c), Options{ChunkBy: "auto", MaxChunkBytes: opts.MaxChunkBytes})
+		if len(parts) == 0 {
+			out = append(out, c)
+			continue
+		}
+		out = append(out, parts...)
+	}
+	return out
 }
