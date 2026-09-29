@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 )
 
 func rec(text string) Record {
@@ -18,6 +19,24 @@ func recs(n int, size int) []Record {
 		out[i] = rec(fmt.Sprintf("%04d%s", i, strings.Repeat("x", size)))
 	}
 	return out
+}
+
+// The per-record overhead must cover the record's real slot, or the byte budget
+// under-counts live memory (Node 3 load run: 64 MB budget held ~97 MB).
+func TestSizeCoversRealRecordFootprint(t *testing.T) {
+	if OverheadPerChunk < int64(unsafe.Sizeof(entry{})) {
+		t.Fatalf("OverheadPerChunk %d < entry size %d", OverheadPerChunk, unsafe.Sizeof(entry{}))
+	}
+	r := rec("hello")
+	unscored := r.size()
+	s := 0.5
+	r.TaskScore = &s
+	if r.size() <= unscored {
+		t.Fatal("a task score must add to the accounted size")
+	}
+	if unscored < OverheadPerChunk+int64(len("hello")) {
+		t.Fatalf("size %d does not include the text", unscored)
+	}
 }
 
 func TestAppendAssignsContiguousSeqsAndTimestamps(t *testing.T) {

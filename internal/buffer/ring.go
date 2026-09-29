@@ -7,10 +7,17 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"unsafe"
 )
 
-// OverheadPerChunk represents estimated memory overhead for struct headers and slice slots.
-const OverheadPerChunk int64 = 88
+// OverheadPerChunk is the fixed in-memory cost of one buffered record: its slot in the
+// buffer (the Record struct with its string headers, plus the size field). Text bytes are
+// counted on top. Measured on the Node 3 load run, the old fixed 88 bytes under-counted the
+// real 280-byte slot, so a 64 MB budget held ~97 MB of live data.
+const OverheadPerChunk = int64(unsafe.Sizeof(entry{}))
+
+// scoreSize is the separately allocated float64 behind a non-nil TaskScore.
+const scoreSize = int64(unsafe.Sizeof(float64(0)))
 
 // Record is one labelled chunk held in the buffer until Node 2 acknowledges it.
 type Record struct {
@@ -35,9 +42,15 @@ type Record struct {
 	ScoreStatus string    `json:"score_status"`
 }
 
-// size estimates the in-memory footprint of a record for capacity accounting.
+// size estimates the in-memory footprint of a record for capacity accounting. Strings
+// shared by all records of one ingest (labels, memory_id, task) are counted per record,
+// which errs on the side of over-counting.
 func (r *Record) size() int64 {
-	return OverheadPerChunk + int64(len(r.ID)+len(r.MemoryID)+len(r.Text)+len(r.Type)+len(r.Format)+
+	n := OverheadPerChunk
+	if r.TaskScore != nil {
+		n += scoreSize
+	}
+	return n + int64(len(r.ID)+len(r.MemoryID)+len(r.Text)+len(r.Type)+len(r.Format)+
 		len(r.Source)+len(r.Session)+len(r.Speaker)+len(r.TurnID)+len(r.ParentID)+len(r.Heading)+len(r.Task)+len(r.ScoreStatus))
 }
 
