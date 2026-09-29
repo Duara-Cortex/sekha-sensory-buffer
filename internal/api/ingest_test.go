@@ -179,6 +179,23 @@ func TestIngestDialogueChunking(t *testing.T) {
 	}
 }
 
+func TestIngestDialogueDedupFollowsTheQuestion(t *testing.T) {
+	srv := newTestServer(1<<20, embed.None{})
+	resp := decodeIngest(t, ingestJSON(t, srv, map[string]any{"type": "dialogue", "source": "chat", "session": "s", "turns": []map[string]string{
+		{"speaker": "assistant", "text": "Shall I delete the logs?"},
+		{"speaker": "user", "text": "yes"},
+		{"speaker": "assistant", "text": "Shall I restart the service?"},
+		{"speaker": "user", "text": "yes"},
+		{"speaker": "assistant", "text": "Shall I delete the logs?"},
+		{"speaker": "user", "text": "yes"},
+	}}))
+	// t6 repeats the answer to a question already answered (t1/t2) -> one duplicate.
+	// t5 re-asks after a different turn, so it is kept.
+	if resp.Accepted != 5 || resp.Discarded["duplicate"] != 1 || resp.Chunks[3].TurnID != "t4" || resp.Chunks[4].TurnID != "t5" {
+		t.Fatalf("accepted=%d discarded=%v", resp.Accepted, resp.Discarded)
+	}
+}
+
 // Acceptance 2 end-to-end on the raw-body log path.
 func TestIngestLogFloorCounts(t *testing.T) {
 	srv := newTestServer(1<<20, embed.None{})
