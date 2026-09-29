@@ -26,6 +26,12 @@ type StatsResponse struct {
 	DroppedBytes       uint64  `json:"dropped_bytes"`
 	IngestionRateKBps  float64 `json:"ingestion_rate_kbps"`
 	UptimeSeconds      float64 `json:"uptime_seconds"`
+	PendingCount       int     `json:"pending_count"`
+	Backpressure       uint64  `json:"backpressure_rejections"`
+	Ingest             struct {
+		ChunksStrong   uint64 `json:"chunks_strong"`
+		ChunksUnscored uint64 `json:"chunks_embedder_unavailable"`
+	} `json:"ingest_telemetry"`
 }
 
 func fetchStats(client *http.Client, url string) (*StatsResponse, error) {
@@ -54,6 +60,9 @@ func main() {
 	duration := flag.Duration("duration", 10*time.Second, "Duration of the benchmark test")
 	batchSize := flag.Int("batch-size", 50, "Number of text lines per HTTP request batch")
 	concurrency := flag.Int("concurrency", 16, "Number of concurrent worker goroutines")
+	task := flag.String("task", "", "Task sent with every ingest; when set, every line is MiniLM-scored")
+	drain := flag.Bool("drain", false, "Act as the Node 2 consumer: drain and acknowledge during the run")
+	timeout := flag.Duration("timeout", 5*time.Second, "Per-request client timeout (raise it for -task runs)")
 	flag.Parse()
 
 	tr := &http.Transport{
@@ -64,7 +73,7 @@ func main() {
 	}
 	client := &http.Client{
 		Transport: tr,
-		Timeout:   5 * time.Second,
+		Timeout:   *timeout,
 	}
 
 	log.Printf("==========================================================")
@@ -75,6 +84,8 @@ func main() {
 	log.Printf(" Batch Size:           %d lines/request", *batchSize)
 	log.Printf(" Concurrency Workers:  %d", *concurrency)
 	log.Printf(" Duration:             %v", *duration)
+	log.Printf(" Task (scoring):       %q", *task)
+	log.Printf(" Drain + ack:          %v", *drain)
 	log.Printf("==========================================================")
 
 	statsBefore, err := fetchStats(client, *statsURL)
@@ -95,6 +106,9 @@ func main() {
 		"session": *session,
 		"text":    strings.Join(lines, "\n"),
 	}
+	if *task != "" {
+		payloadMap["task"] = *task
+	}
 	payloadBytes, _ := json.Marshal(payloadMap)
 
 	reqsPerSec := *targetLinesPerSec / *batchSize
@@ -112,6 +126,8 @@ func main() {
 	var totalLinesSent int64
 	var totalReqsSuccess int64
 	var totalReqsFailed int64
+	var totalReqsBackpressure int64
+	var totalReqsSkipped int64
 
 	var latenciesMu sync.Mutex
 	var latencies []time.Duration
@@ -148,6 +164,8 @@ func main() {
 				if resp.StatusCode == http.StatusCreated {
 					atomic.AddInt64(&totalReqsSuccess, 1)
 					localLatencies = append(localLatencies, elapsed)
+				} else if resp.StatusCode == http.StatusServiceUnavailable {
+					atomic.AddInt64(&totalReqsBackpressure, 1)
 				} else {
 					atomic.AddInt64(&totalReqsFailed, 1)
 				}
@@ -157,6 +175,10 @@ func main() {
 			latencies = append(latencies, localLatencies...)
 			latenciesMu.Unlock()
 		}()
+	}
+
+	if *drain {
+		go drainLoop(client, strings.TrimSuffix(*targetURL, "/api/v1/sensory/ingest"))
 	}
 
 	testStart := time.Now()
@@ -172,7 +194,8 @@ generatorLoop:
 			select {
 			case workChan <- struct{}{}:
 			default:
-				// Worker queue saturated
+				// Worker queue saturated: this request is never sent.
+				atomic.AddInt64(&totalReqsSkipped, 1)
 			}
 		}
 	}
@@ -213,7 +236,9 @@ generatorLoop:
 	fmt.Println("================== BENCHMARK RESULTS ==================")
 	fmt.Printf(" Duration:             %.2f seconds\n", totalTestDuration.Seconds())
 	fmt.Printf(" Successful Requests:  %d\n", totalReqsSuccess)
-	fmt.Printf(" Failed Requests:      %d\n", totalReqsFailed)
+	fmt.Printf(" Back-pressure (503):  %d\n", totalReqsBackpressure)
+	fmt.Printf(" Failed Requests:      %d (errors, timeouts, other statuses)\n", totalReqsFailed)
+	fmt.Printf(" Skipped (client queue saturated): %d\n", totalReqsSkipped)
 	fmt.Printf(" Total Ingested Lines: %d\n", totalReqsSuccess*int64(*batchSize))
 	fmt.Printf(" Effective Ingest Rate:%.0f lines/sec (%.1f reqs/sec)\n", actualLinesPerSec, actualReqsPerSec)
 	fmt.Println("----------------- Request Latency ---------------------")
@@ -229,16 +254,58 @@ generatorLoop:
 		deltaIngested := statsAfter.TotalIngestedCount - statsBefore.TotalIngestedCount
 		deltaDropped := statsAfter.DroppedPackets - statsBefore.DroppedPackets
 		fmt.Printf(" Total Chunks Added:   %d\n", deltaIngested)
-		fmt.Printf(" Chunks Evicted/Drop:  %d\n", deltaDropped)
+		fmt.Printf(" Unacked Chunks Lost:  %d (must be 0)\n", deltaDropped)
+		fmt.Printf(" Pending (unacked):    %d\n", statsAfter.PendingCount)
+		if *task != "" {
+			fmt.Printf(" Strong / Unscored:    %d / %d\n",
+				statsAfter.Ingest.ChunksStrong-statsBefore.Ingest.ChunksStrong,
+				statsAfter.Ingest.ChunksUnscored-statsBefore.Ingest.ChunksUnscored)
+		}
 		fmt.Printf(" Buffer Fill %%:        %.2f%%\n", statsAfter.FillPercent)
 		fmt.Printf(" Buffer Memory Used:   %.2f MB / %.2f MB\n", float64(statsAfter.UsedBytes)/(1024*1024), float64(statsAfter.CapacityBytes)/(1024*1024))
 		fmt.Printf(" Daemon Measured Rate: %.2f KB/s\n", statsAfter.IngestionRateKBps)
 	}
 	fmt.Println("=======================================================")
 
-	if totalReqsFailed == 0 && avgLat < 10*time.Millisecond {
+	switch {
+	case totalReqsFailed > 0:
+		fmt.Printf(">> RESULT: WARN - %d failed requests (errors or client timeouts).\n", totalReqsFailed)
+	case totalReqsBackpressure > 0:
+		fmt.Printf(">> RESULT: BACK-PRESSURE - %d requests refused with 503 (buffer full of unacked chunks; nothing lost).\n", totalReqsBackpressure)
+	case totalReqsSkipped > 0:
+		fmt.Printf(">> RESULT: SATURATED - target rate not reached; %d requests never sent. Lower -lines-per-sec.\n", totalReqsSkipped)
+	case *task != "":
+		fmt.Printf(">> RESULT: OK (scored run) - %.0f lines/sec sustained with MiniLM scoring, mean latency %v.\n", actualLinesPerSec, avgLat)
+	case avgLat < 10*time.Millisecond:
 		fmt.Println(">> RESULT: PASS - High throughput & sub-millisecond per-line latency confirmed.")
-	} else if totalReqsFailed > 0 {
-		fmt.Printf(">> RESULT: WARN - Encountered %d failed requests.\n", totalReqsFailed)
+	default:
+		fmt.Printf(">> RESULT: OK - mean latency %v.\n", avgLat)
+	}
+}
+
+// drainLoop repeatedly drains and acknowledges the buffer, mimicking Node 2.
+func drainLoop(client *http.Client, baseURL string) {
+	for {
+		resp, err := client.Get(baseURL + "/api/v1/sensory/drain?max=4096")
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		var d struct {
+			Epoch   string            `json:"epoch"`
+			Chunks  []json.RawMessage `json:"chunks"`
+			LastSeq uint64            `json:"last_seq"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&d)
+		resp.Body.Close()
+		if err != nil || len(d.Chunks) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		ack, _ := json.Marshal(map[string]interface{}{"epoch": d.Epoch, "up_to_seq": d.LastSeq})
+		if resp, err := client.Post(baseURL+"/api/v1/sensory/ack", "application/json", bytes.NewReader(ack)); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 	}
 }
