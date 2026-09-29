@@ -1,14 +1,17 @@
 [Unit]
-Description=Sekha Node 3 Sensory Text Ring Buffer Daemon
-After=network.target network-online.target
-Wants=network-online.target
+Description=Sekha Node 3 Sensory Layer (labelled ingest and buffer)
+After=network.target network-online.target sekha-embed.service
+Wants=network-online.target sekha-embed.service
 Documentation=https://github.com/Duara-Cortex/sekha-sensory-buffer
 
 [Service]
 Type=simple
 User=admin
 Group=admin
-ExecStart=/usr/local/bin/sekha-sensory-buffer -host 0.0.0.0 -port 8081 -capacity-mb 64
+# All configuration comes from the env file (see .env.example); the leading '-' means a
+# missing file is allowed and built-in defaults apply.
+EnvironmentFile=-/etc/sekha/sensory-buffer.env
+ExecStart=/usr/local/bin/sekha-sensory-buffer
 Restart=always
 RestartSec=3s
 

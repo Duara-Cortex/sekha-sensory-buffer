@@ -8,38 +8,26 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/api"
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/buffer"
+	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/config"
+	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/embed"
+	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/version"
 )
 
-func getEnv(key, fallback string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		return val
-	}
-	return fallback
-}
-
-func getEnvInt(key string, fallback int) int {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
-		}
-	}
-	return fallback
-}
-
 func main() {
-	defaultHost := getEnv("SEKHA_HOST", "0.0.0.0")
-	defaultPort := getEnvInt("SEKHA_PORT", 8081)
-	defaultCapacityMB := getEnvInt("SEKHA_CAPACITY_MB", 64)
+	cfg, err := config.Load(os.LookupEnv)
+	if err != nil {
+		log.Fatalf("[Sekha Sensory Buffer] %v", err)
+	}
 
-	host := flag.String("host", defaultHost, "Bind address for HTTP server")
-	port := flag.Int("port", defaultPort, "Listening port for HTTP server")
-	capacityMB := flag.Int("capacity-mb", defaultCapacityMB, "Ring buffer capacity in Megabytes")
+	// Flags override the environment (useful for local runs); systemd relies on the env file.
+	host := flag.String("host", cfg.Host, "Bind address for HTTP server (SEKHA_HOST)")
+	port := flag.Int("port", cfg.Port, "Listening port for HTTP server (SEKHA_PORT)")
+	capacityMB := flag.Int("capacity-mb", cfg.CapacityMB, "Ring buffer capacity in Megabytes (SEKHA_CAPACITY_MB)")
 	flag.Parse()
 
 	if *capacityMB <= 0 {
@@ -47,17 +35,25 @@ func main() {
 	}
 
 	capacityBytes := int64(*capacityMB) * 1024 * 1024
-	log.Printf("[Sekha Sensory Buffer] Initialising circular ring buffer (Capacity: %d MB / %d bytes)", *capacityMB, capacityBytes)
-
 	rb := buffer.New(capacityBytes)
-	server := api.NewServer(rb)
+	log.Printf("[Sekha Sensory Buffer] v%s starting (epoch %s); buffer capacity %d MB, unacknowledged chunks are never evicted", version.Version, rb.Epoch(), *capacityMB)
+
+	var embedder embed.Embedder = embed.None{}
+	if cfg.EmbedProvider == config.ProviderOpenAI {
+		embedder = embed.NewOpenAI(cfg.EmbedURL, cfg.EmbedAPIKey, cfg.EmbedModel, cfg.EmbedDim, cfg.EmbedBatchSize, cfg.EmbedTimeout)
+		log.Printf("[Sekha Sensory Buffer] task scoring via %s (model %s, %d-D); strong threshold %.2f", cfg.EmbedURL, cfg.EmbedModel, cfg.EmbedDim, cfg.StrongThreshold)
+	} else {
+		log.Printf("[Sekha Sensory Buffer] SEKHA_EMBED_PROVIDER=none: task scoring disabled, no chunk will be marked strong")
+	}
+
+	server := api.NewServer(cfg, rb, embedder)
 
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           server,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       60 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -74,7 +70,7 @@ func main() {
 	}()
 
 	sig := <-stopChan
-	log.Printf("[Sekha Sensory Buffer] Received signal %v; initiating graceful shutdown...", sig)
+	log.Printf("[Sekha Sensory Buffer] Received signal %v; initiating graceful shutdown (%d unacknowledged chunks will be lost)...", sig, rb.Pending())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
