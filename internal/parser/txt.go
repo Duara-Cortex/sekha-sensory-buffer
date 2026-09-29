@@ -202,3 +202,9 @@ func ParseTXT(data []byte, opts Options) ([]string, error) {
 		return parseLogOrLineStream(text, maxBytes), nil
 	}
 }
+
+// SplitAtBoundaries partitions text into pieces of at most maxBytes, preferring line,
+// sentence and word boundaries. It is exported for the labelled-ingest chunker.
+func SplitAtBoundaries(text string, maxBytes int) []string {
+	return splitAtSemanticBoundaries(text, maxBytes)
+}

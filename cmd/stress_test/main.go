@@ -190,8 +190,10 @@ func runRateTier(
 			for range workChan {
 				item := syntheticWorkloads[(workerID+int(atomic.LoadInt64(&totalReqsSent)))%len(syntheticWorkloads)]
 				payload := map[string]string{
-					"origin": item.Origin,
-					"data":   item.Data,
+					"type":    "log",
+					"source":  item.Origin,
+					"session": "stress-test",
+					"text":    item.Data,
 				}
 				payloadBytes, _ := json.Marshal(payload)
 
@@ -317,6 +319,7 @@ func main() {
 	stageDuration := flag.Duration("stage-duration", 15*time.Second, "Duration for each test tier (e.g. 15s or 60s)")
 	concurrency := flag.Int("concurrency", 32, "Concurrent worker connections")
 	task := flag.String("task", "monitor memory leaks, architectural fractals and thermal alerts", "Active task directive")
+	drain := flag.Bool("drain", true, "Act as the Node 2 consumer: drain and acknowledge chunks during the run")
 	flag.Parse()
 
 	ingestURL := *baseURL + "/api/v1/sensory/ingest"
@@ -347,6 +350,12 @@ func main() {
 	log.Printf(" Node: Raspberry Pi 5 (4GB RAM) • Target Daemon: %s", *baseURL)
 	log.Printf(" Stage Duration: %v per tier • Concurrency: %d workers", *stageDuration, *concurrency)
 	log.Printf("==================================================================")
+
+	if *drain {
+		// Stand-in for Node 2 (Task 30): drain and acknowledge so the buffer does not apply
+		// back-pressure for the whole run. Disable with -drain=false to measure back-pressure.
+		go drainLoop(client, *baseURL)
+	}
 
 	tiers := []int{100, 500, 1000, 5000}
 	var results []TierResult
@@ -385,5 +394,32 @@ func main() {
 		fmt.Println(">> 🏆 ALL TIERS PASSED: Sub-millisecond ingestion, continuous active salience gating, and bounded memory verified.")
 	} else {
 		fmt.Println(">> ⚠️ BENCHMARK COMPLETED WITH WARNINGS.")
+	}
+}
+
+// drainLoop repeatedly drains and acknowledges the buffer, mimicking Node 2.
+func drainLoop(client *http.Client, baseURL string) {
+	for {
+		resp, err := client.Get(baseURL + "/api/v1/sensory/drain?max=4096")
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		var d struct {
+			Epoch   string            `json:"epoch"`
+			Chunks  []json.RawMessage `json:"chunks"`
+			LastSeq uint64            `json:"last_seq"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&d)
+		resp.Body.Close()
+		if err != nil || len(d.Chunks) == 0 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		ack, _ := json.Marshal(map[string]interface{}{"epoch": d.Epoch, "up_to_seq": d.LastSeq})
+		if resp, err := client.Post(baseURL+"/api/v1/sensory/ack", "application/json", bytes.NewReader(ack)); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 	}
 }

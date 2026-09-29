@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +49,7 @@ func fetchStats(client *http.Client, url string) (*StatsResponse, error) {
 func main() {
 	targetURL := flag.String("url", "http://127.0.0.1:8081/api/v1/sensory/ingest", "Ingest endpoint URL")
 	statsURL := flag.String("stats-url", "http://127.0.0.1:8081/api/v1/sensory/stats", "Stats endpoint URL")
+	session := flag.String("session", "benchmark-"+time.Now().UTC().Format("20060102T150405Z"), "Session label sent with every ingest")
 	targetLinesPerSec := flag.Int("lines-per-sec", 10000, "Target text lines to ingest per second")
 	duration := flag.Duration("duration", 10*time.Second, "Duration of the benchmark test")
 	batchSize := flag.Int("batch-size", 50, "Number of text lines per HTTP request batch")
@@ -85,9 +87,13 @@ func main() {
 	for i := 0; i < *batchSize; i++ {
 		lines = append(lines, fmt.Sprintf("sensory_stimulus_event_%04d timestamp=%s payload=\"sample telemetry trace data from node3 sensor input\"", i, time.Now().Format(time.RFC3339Nano)))
 	}
+	// Unique per line so the floor's duplicate rule does not drop repeated batches' lines
+	// within one request (each request is its own input).
 	payloadMap := map[string]interface{}{
-		"origin": "benchmark-agent",
-		"items":  lines,
+		"type":    "log",
+		"source":  "benchmark-agent",
+		"session": *session,
+		"text":    strings.Join(lines, "\n"),
 	}
 	payloadBytes, _ := json.Marshal(payloadMap)
 

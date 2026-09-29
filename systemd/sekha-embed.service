@@ -1,0 +1,30 @@
+[Unit]
+Description=Sekha Node 3 local MiniLM embedding server (llama-server, loopback only)
+After=network.target
+Documentation=https://github.com/Duara-Cortex/sekha-sensory-buffer
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+# Reads SEKHA_EMBED_SERVER_BIN, SEKHA_EMBED_MODEL_PATH, SEKHA_EMBED_MODEL, SEKHA_EMBED_BIND,
+# SEKHA_EMBED_PORT, SEKHA_EMBED_THREADS, SEKHA_EMBED_PARALLEL, SEKHA_EMBED_CTX and SEKHA_EMBED_UBATCH.
+EnvironmentFile=/etc/sekha/sensory-buffer.env
+# Default bind is 127.0.0.1: only the sensory service on this node can reach it, so no API key.
+# llama-server divides -c across -np slots, so keep SEKHA_EMBED_CTX = 512 x SEKHA_EMBED_PARALLEL
+# (512 = MiniLM's full position range). -ub must hold one whole input (embeddings are not causal).
+ExecStart=/bin/sh -c 'exec "${SEKHA_EMBED_SERVER_BIN}" -m "${SEKHA_EMBED_MODEL_PATH}" --alias "${SEKHA_EMBED_MODEL}" --embeddings --pooling mean --host "${SEKHA_EMBED_BIND}" --port "${SEKHA_EMBED_PORT}" -t "${SEKHA_EMBED_THREADS}" -np "${SEKHA_EMBED_PARALLEL}" -c "${SEKHA_EMBED_CTX}" -b "${SEKHA_EMBED_UBATCH}" -ub "${SEKHA_EMBED_UBATCH}"'
+Restart=always
+RestartSec=3s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sekha-embed
+
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

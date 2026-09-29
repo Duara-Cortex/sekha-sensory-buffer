@@ -31,10 +31,13 @@ install:
 	@test "$$(id -u)" -eq 0 || { echo "install must be run as root: sudo make install"; exit 1; }
 	systemctl stop sekha-sensory-buffer.service 2>/dev/null || true
 	cp bin/$(BINARY_NAME) /usr/local/bin/
-	cp systemd/sekha-sensory-buffer.service /etc/systemd/system/
+	cp systemd/sekha-sensory-buffer.service systemd/sekha-embed.service /etc/systemd/system/
+	install -d -m 0755 /etc/sekha
+	@test -f /etc/sekha/sensory-buffer.env || { install -m 0600 .env.example /etc/sekha/sensory-buffer.env; echo "Created /etc/sekha/sensory-buffer.env from .env.example"; }
 	systemctl daemon-reload
 	systemctl restart sekha-sensory-buffer.service
 	@echo "Daemon updated and restarted: sekha-sensory-buffer.service"
+	@echo "Embedding server unit installed; enable once the model is in place: sudo systemctl enable --now sekha-embed.service"
 
 test:
 	go test -v -race ./...
