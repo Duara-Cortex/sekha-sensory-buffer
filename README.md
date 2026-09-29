@@ -40,7 +40,7 @@ Only these chunks are dropped. Nothing is ever dropped for a low score.
 | `blank` | Chunk is empty or whitespace (a blank log line, an empty turn or item). Blank lines *between* paragraphs are delimiters and are not counted. | all |
 | `separator` | Whole chunk matches `SEKHA_FLOOR_SEPARATOR_PATTERN`, e.g. `-----`, `=====`, `****`. | all |
 | `heartbeat` | Every line matches `SEKHA_FLOOR_HEARTBEAT_PATTERN` (ping/pong, `64 bytes from … icmp_seq=`, `heartbeat … ok`) and none matches `SEKHA_FLOOR_HEARTBEAT_EXCLUDE_PATTERN`, so `heartbeat missed`, `status not ok` and `Destination Host Unreachable` are kept. | `SEKHA_FLOOR_HEARTBEAT_TYPES` (default `log`, so a chat message saying "ping" is kept) |
-| `duplicate` | Exact repeat of an earlier chunk in the same request. For dialogue the key is speaker + text: the same "yes" from the same speaker is stored once, and from two different speakers it's stored twice. | `SEKHA_FLOOR_DEDUP_TYPES` (default all) |
+| `duplicate` | Exact repeat of an earlier chunk in the same request. For dialogue the key is speaker + text + **the question it answers** (the most recent earlier non-blank turn by a different speaker, matched by its text). So a user's "yes" to "Shall I delete the logs?" and "yes" to "Shall I restart?" are both kept, a second "yes" to the same question text is stored once, and the same words from two different speakers are both kept. | `SEKHA_FLOOR_DEDUP_TYPES` (default all) |
 
 Every ingest response reports `discarded` counts for all four reasons.
 
