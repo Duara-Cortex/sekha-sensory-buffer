@@ -197,7 +197,7 @@ All configuration is environment variables with built-in defaults. On Node 3 the
 | Key | Default | Purpose |
 | :--- | :--- | :--- |
 | `SEKHA_HOST` / `SEKHA_PORT` | `0.0.0.0` / `8081` | Bind address (the flags `-host`/`-port` override). |
-| `SEKHA_CAPACITY_MB` | `64` | Buffer byte budget (`-capacity-mb` overrides). |
+| `SEKHA_CAPACITY_MB` | `64` | Buffer byte budget (`-capacity-mb` overrides). It counts text plus each record's in-memory structure, so it tracks live data closely. Plan for 2–3× this in process RAM because of garbage-collection headroom; 64 MB measured about 300 MiB RSS on Node 3. |
 | `SEKHA_MAX_BODY_BYTES` | `16777216` | Maximum ingest body. |
 | `SEKHA_HTTP_WRITE_TIMEOUT_S` | `120` | HTTP write timeout (ingest waits for embedding). |
 | `SEKHA_BACKPRESSURE_RETRY_AFTER_S` | `5` | `Retry-After` on `503 buffer_full`. |
@@ -231,6 +231,7 @@ Keep regex values in single quotes in the env file: systemd strips backslashes f
 - **Restart loss (accepted).** The buffer is RAM only. Unacknowledged chunks are lost on restart or crash. The new `epoch` tells Node 2 this happened: an ack with the old epoch gets `409`. The shutdown log line records how many were pending.
 - **No secret detection.** This service has never detected or redacted secrets, and it still doesn't. Input is stored verbatim and sent to the embedding server, which runs on loopback on Node 3 by default.
 - **No idempotency key.** If a client retries after a timeout, the memory can be stored twice under two `memory_id`s. Chunk `id`s are content hashes, so downstream can spot the duplicates.
+- **Memory is 2–3× the buffer budget.** `SEKHA_CAPACITY_MB` counts the chunks themselves, and Go's garbage collector needs room on top. Size it against the node's free RAM, e.g. 64 MB → about 300 MiB, 512 MB → about 1.5 GB.
 - **Single consumer.** The drain/ack contract assumes one consumer, Node 2.
 
 ---
