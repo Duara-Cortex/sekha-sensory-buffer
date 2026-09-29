@@ -69,15 +69,69 @@ func TestHeartbeatRuleOnlyForConfiguredTypes(t *testing.T) {
 	}
 }
 
-func TestDialogueDedupIsPerSpeaker(t *testing.T) {
-	cands := []chunker.Candidate{
-		{Text: "yes", Speaker: "user"},
-		{Text: "yes", Speaker: "assistant"},
-		{Text: "yes", Speaker: "user"},
+func dialogue(turns ...[2]string) []chunker.Candidate {
+	var ts []chunker.Turn
+	for _, t := range turns {
+		ts = append(ts, chunker.Turn{Speaker: t[0], Text: t[1]})
 	}
-	kept, counts := defaultRules().Apply(config.TypeDialogue, cands)
-	if len(kept) != 2 || counts[ReasonDuplicate] != 1 || kept[1].Speaker != "assistant" {
-		t.Fatalf("kept=%+v counts=%v", kept, counts)
+	return chunker.Dialogue(ts, 1024)
+}
+
+func texts(cs []chunker.Candidate) string {
+	var out []string
+	for _, c := range cs {
+		out = append(out, c.TurnID+":"+c.Text)
+	}
+	return strings.Join(out, " | ")
+}
+
+func TestDialogueYesToDifferentQuestionsIsKept(t *testing.T) {
+	kept, counts := defaultRules().Apply(config.TypeDialogue, dialogue(
+		[2]string{"assistant", "Shall I delete the logs?"},
+		[2]string{"user", "yes"},
+		[2]string{"assistant", "Shall I restart the service?"},
+		[2]string{"user", "yes"},
+	))
+	if len(kept) != 4 || counts[ReasonDuplicate] != 0 {
+		t.Fatalf("a yes to a different question must be kept: %s (%v)", texts(kept), counts)
+	}
+}
+
+func TestDialogueYesToSameQuestionIsOne(t *testing.T) {
+	kept, counts := defaultRules().Apply(config.TypeDialogue, dialogue(
+		[2]string{"assistant", "Are you sure?"},
+		[2]string{"user", "yes"},
+		[2]string{"assistant", "Are you sure?"},
+		[2]string{"user", "yes"},
+	))
+	// Asking again after a "yes" is kept (it follows a different turn); the second "yes"
+	// answers the same question text, so it is the one duplicate.
+	if texts(kept) != "t1:Are you sure? | t2:yes | t3:Are you sure?" || counts[ReasonDuplicate] != 1 {
+		t.Fatalf("got %s (%v)", texts(kept), counts)
+	}
+}
+
+func TestDialogueDedupIsPerSpeaker(t *testing.T) {
+	kept, counts := defaultRules().Apply(config.TypeDialogue, dialogue(
+		[2]string{"user", "Ready?"},
+		[2]string{"assistant", "yes"},
+		[2]string{"user", "yes"},
+	))
+	if len(kept) != 3 || counts[ReasonDuplicate] != 0 {
+		t.Fatalf("same words from different speakers must both be kept: %s (%v)", texts(kept), counts)
+	}
+}
+
+func TestDialogueQuestionSkipsBlankTurnsAndSameSpeaker(t *testing.T) {
+	kept, counts := defaultRules().Apply(config.TypeDialogue, dialogue(
+		[2]string{"assistant", "Proceed?"},
+		[2]string{"user", "yes"},
+		[2]string{"assistant", "   "}, // blank: not a question
+		[2]string{"user", "hold on"},  // same speaker: not a question for the next turn
+		[2]string{"user", "yes"},      // still answering "Proceed?" -> duplicate
+	))
+	if texts(kept) != "t1:Proceed? | t2:yes | t4:hold on" || counts[ReasonDuplicate] != 1 || counts[ReasonBlank] != 1 {
+		t.Fatalf("got %s (%v)", texts(kept), counts)
 	}
 }
 
