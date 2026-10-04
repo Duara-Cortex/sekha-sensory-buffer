@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,6 +49,10 @@ const (
 	DefaultDrainMaxLimit         = 4096
 	DefaultBackpressureRetryS    = 5
 	DefaultLegacyFilterThreshold = 0.75
+	DefaultPushBatch             = 256
+	DefaultPushIntervalMS        = 1000
+	DefaultPushMaxBackoffMS      = 30000
+	DefaultPushTimeoutMS         = 10000
 )
 
 // Config is the fully resolved service configuration.
@@ -80,6 +85,14 @@ type Config struct {
 	BackpressureRetryS int
 
 	LegacyFilterThreshold float64
+
+	// PushURL is Node 2's receive endpoint. Empty disables the push loop (pull mode).
+	PushURL        string
+	PushAPIKey     string
+	PushBatch      int
+	PushInterval   time.Duration
+	PushMaxBackoff time.Duration
+	PushTimeout    time.Duration
 }
 
 // LookupFunc matches os.LookupEnv.
@@ -198,6 +211,13 @@ func Load(lookup LookupFunc) (Config, error) {
 		BackpressureRetryS: l.intVal("SEKHA_BACKPRESSURE_RETRY_AFTER_S", DefaultBackpressureRetryS, 0),
 
 		LegacyFilterThreshold: l.floatVal("SEKHA_FILTER_THRESHOLD", DefaultLegacyFilterThreshold, 0.01, 0.99),
+
+		PushURL:        l.str("SEKHA_PUSH_URL", ""),
+		PushAPIKey:     l.str("SEKHA_PUSH_API_KEY", ""),
+		PushBatch:      l.intVal("SEKHA_PUSH_BATCH", DefaultPushBatch, 1),
+		PushInterval:   time.Duration(l.intVal("SEKHA_PUSH_INTERVAL_MS", DefaultPushIntervalMS, 10)) * time.Millisecond,
+		PushMaxBackoff: time.Duration(l.intVal("SEKHA_PUSH_MAX_BACKOFF_MS", DefaultPushMaxBackoffMS, 10)) * time.Millisecond,
+		PushTimeout:    time.Duration(l.intVal("SEKHA_PUSH_TIMEOUT_MS", DefaultPushTimeoutMS, 1)) * time.Millisecond,
 	}
 
 	if c.EmbedProvider != ProviderOpenAI && c.EmbedProvider != ProviderNone {
@@ -205,6 +225,15 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 	if c.DrainMaxDefault > c.DrainMaxLimit {
 		l.errs = append(l.errs, fmt.Sprintf("SEKHA_DRAIN_MAX_DEFAULT (%d) exceeds SEKHA_DRAIN_MAX_LIMIT (%d)", c.DrainMaxDefault, c.DrainMaxLimit))
+	}
+
+	if c.PushURL != "" {
+		if u, err := url.Parse(c.PushURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			l.errs = append(l.errs, fmt.Sprintf("SEKHA_PUSH_URL=%q: want an http:// or https:// URL", c.PushURL))
+		}
+	}
+	if c.PushMaxBackoff < c.PushInterval {
+		l.errs = append(l.errs, fmt.Sprintf("SEKHA_PUSH_MAX_BACKOFF_MS (%v) is less than SEKHA_PUSH_INTERVAL_MS (%v)", c.PushMaxBackoff, c.PushInterval))
 	}
 
 	if len(l.errs) > 0 {

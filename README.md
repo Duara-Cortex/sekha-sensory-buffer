@@ -10,12 +10,13 @@ The **Node 3** (`sekha-node3` &bull; `192.168.8.183`) service of the **Sekha Tri
 1. The caller sends **labelled** input: dialogue, document or log.
 2. Node 3 **chunks** it by type and drops only non-information (the **floor**).
 3. When a task is given, every chunk gets a **semantic task score** (MiniLM cosine similarity). The score **routes** chunks and never gates them: a *strong* chunk is processed by Node 2's model, and a *weak* chunk is only stored.
-4. Every chunk that passes the floor goes into an in-memory buffer. **Node 2 drains** the buffer and **acknowledges** what it received. Nothing unacknowledged is ever evicted: a full buffer refuses new input instead (back-pressure).
+4. Every chunk that passes the floor goes into an in-memory buffer. With `SEKHA_PUSH_URL` set, **Node 3 pushes** batches to Node 2 and evicts them once Node 2 replies `200`; otherwise **Node 2 drains** the buffer and **acknowledges** what it received. Nothing undelivered is ever evicted: a full buffer refuses new input instead (back-pressure).
 
 ```
-caller ──POST /ingest──▶ label check ─▶ chunk by type ─▶ floor ─▶ task score ─▶ buffer ◀──GET /drain── Node 2
-                          (400 if missing)              (counts)  (strong/weak)  (503 if full) ──POST /ack──▶
+caller ──POST /ingest──▶ label check ─▶ chunk by type ─▶ floor ─▶ task score ─▶ buffer ──POST batch──▶ Node 2
+                          (400 if missing)              (counts)  (strong/weak)  (503 if full) ◀───200─────
 ```
+(Push mode. In pull mode Node 2 calls `GET /drain` and `POST /ack` instead.)
 
 ---
 
@@ -140,9 +141,26 @@ cat syslog.log | curl -X POST "http://192.168.8.183:8081/api/v1/sensory/ingest?t
 | 413 | `exceeds_buffer_capacity` | One request is larger than the whole buffer; split it. |
 | 503 | `buffer_full` | **Back-pressure.** Unacknowledged chunks fill the buffer. Nothing from the request was stored (each ingest is all-or-nothing). Retry after `Retry-After` seconds. |
 
-### 2. Drain / ack contract (for Node 2, Task 30)
+### 2. Delivery to Node 2 (Task 30)
 
-Node 2 **pulls**; Node 3 never needs Node 2's address. Delivery is **at-least-once** to a **single consumer**.
+Delivery is **at-least-once** to a **single consumer**, in one of two modes.
+
+#### Push mode (`SEKHA_PUSH_URL` set)
+
+Node 3 POSTs the oldest undelivered chunks to `SEKHA_PUSH_URL`, at most `SEKHA_PUSH_BATCH` per request. The body is the same JSON as a drain response:
+```json
+{"epoch": "4f9c2a1b7e3d5a60", "chunks": [ /* chunk records, seq order */ ], "last_seq": 356, "pending": 1200, "more": true}
+```
+- **Only `200` counts as received.** Node 3 then evicts every chunk in the batch and sends the next one right away. Node 2 must reply `200` only once the chunks are durably stored.
+- **Anything else keeps the batch:** another status (including `201`, `202` and `204`), a timeout after `SEKHA_PUSH_TIMEOUT_MS`, or no connection. Node 3 retries the same chunks after `SEKHA_PUSH_INTERVAL_MS`, doubling the delay after each failure up to `SEKHA_PUSH_MAX_BACKOFF_MS`. While Node 2 is down, new input fills the buffer and then gets `503 buffer_full`, as before.
+- **Duplicates are possible:** if a `200` is lost on the way back, the batch is sent again. De-duplicate on `(epoch, seq)`. A new `epoch` means Node 3 restarted and seqs restarted at 1.
+- `Authorization: Bearer <SEKHA_PUSH_API_KEY>` is sent when the key is set.
+- The first failure and the recovery are each logged once, not every retry.
+- `GET /drain` and `POST /ack` return `409 push_mode`, so no second consumer can take chunks. `GET /buffer` still works for looking, but shows only undelivered chunks, since delivered ones are evicted at once. Run the stress and benchmark tools with `-drain=false` in this mode.
+
+#### Pull mode (`SEKHA_PUSH_URL` empty, the default)
+
+Node 2 **pulls**; Node 3 never needs Node 2's address.
 
 **`GET /api/v1/sensory/drain?max=N&after_seq=S`** returns the oldest unacknowledged chunks, in `seq` order:
 ```json
@@ -201,7 +219,13 @@ All configuration is environment variables with built-in defaults. On Node 3 the
 | `SEKHA_MAX_BODY_BYTES` | `16777216` | Maximum ingest body. |
 | `SEKHA_HTTP_WRITE_TIMEOUT_S` | `120` | HTTP write timeout (ingest waits for embedding). |
 | `SEKHA_BACKPRESSURE_RETRY_AFTER_S` | `5` | `Retry-After` on `503 buffer_full`. |
-| `SEKHA_DRAIN_MAX_DEFAULT` / `SEKHA_DRAIN_MAX_LIMIT` | `256` / `4096` | Drain page size and its cap. |
+| `SEKHA_DRAIN_MAX_DEFAULT` / `SEKHA_DRAIN_MAX_LIMIT` | `256` / `4096` | Drain page size and its cap (pull mode). |
+| `SEKHA_PUSH_URL` | *(empty)* | Node 2's receive endpoint. Set it to turn on push mode; empty means pull mode. |
+| `SEKHA_PUSH_API_KEY` | *(empty)* | Bearer token sent to Node 2, if it needs one. Never logged. |
+| `SEKHA_PUSH_BATCH` | `256` | Chunks per POST. |
+| `SEKHA_PUSH_INTERVAL_MS` | `1000` | Wait when the buffer is empty, and the first retry delay. |
+| `SEKHA_PUSH_MAX_BACKOFF_MS` | `30000` | Cap on the doubling retry delay. |
+| `SEKHA_PUSH_TIMEOUT_MS` | `10000` | Per-POST timeout; a timeout is a failure and the batch is resent. |
 | `SEKHA_CHUNK_MAX_BYTES` | `1024` | Chunk size limit (~250 tokens, inside MiniLM's window). |
 | `SEKHA_FLOOR_SEPARATOR_PATTERN` | see `.env.example` | Separator-line regex (RE2). |
 | `SEKHA_FLOOR_HEARTBEAT_PATTERN` | see `.env.example` | Heartbeat/ping regex (RE2). |
@@ -232,7 +256,9 @@ Keep regex values in single quotes in the env file: systemd strips backslashes f
 - **No secret detection.** This service has never detected or redacted secrets, and it still doesn't. Input is stored verbatim and sent to the embedding server, which runs on loopback on Node 3 by default.
 - **No idempotency key.** If a client retries after a timeout, the memory can be stored twice under two `memory_id`s. Chunk `id`s are content hashes, so downstream can spot the duplicates.
 - **Memory is 2–3× the buffer budget.** `SEKHA_CAPACITY_MB` counts the chunks themselves, and Go's garbage collector needs room on top. Size it against the node's free RAM, e.g. 64 MB → about 300 MiB, 512 MB → about 1.5 GB.
-- **Single consumer.** The drain/ack contract assumes one consumer, Node 2.
+- **Single consumer.** Delivery assumes one consumer, Node 2. In push mode `/drain` and `/ack` are disabled to enforce this.
+- **Two cores per node.** No Sekha node may use more than 2 threads: more took Node 3 down on 2026-09-29. Both systemd units are pinned to cores 0 and 1 (`CPUAffinity=0 1`) and the service runs with `GOMAXPROCS=2`, so ingest and embedding share those two cores and scored throughput drops when both are busy. The stress and benchmark tools are not covered by this cap: run them from a workstation, not on Node 3.
+- **Memory cap.** The service unit sets `GOMEMLIMIT=350MiB`, `MemoryHigh=400M` and `MemoryMax=512M`, so a runaway process is restarted instead of freezing the node. A restart loses every undelivered chunk. If you raise `SEKHA_CAPACITY_MB`, keep `MemoryMax` at about 3 × the budget + 300M, with `MemoryHigh` and `GOMEMLIMIT` below it. The cgroup limits need the memory controller: `cat /sys/fs/cgroup/cgroup.controllers` must list `memory` (on older Pi kernels, add `cgroup_enable=memory` to `/boot/firmware/cmdline.txt`).
 
 ---
 
@@ -318,6 +344,7 @@ sudo install -d -m 0755 /etc/sekha
 test -f /etc/sekha/sensory-buffer.env || sudo install -m 0600 /tmp/.env.example /etc/sekha/sensory-buffer.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now sekha-sensory-buffer.service
+sudo systemctl try-restart sekha-sensory-buffer.service sekha-embed.service   # pick up new units
 ```
 
 ---
@@ -334,7 +361,7 @@ sudo systemctl enable --now sekha-sensory-buffer.service
   -batch-size 50
 ```
 
-The benchmark sends labelled `type=log` input. Nothing drains the buffer during the run, so a long run eventually gets `503 buffer_full`; that is back-pressure working as designed.
+Run it from a workstation, not on Node 3 (see *Two cores per node*). The benchmark sends labelled `type=log` input. Unless push mode is on, nothing drains the buffer during the run, so a long run eventually gets `503 buffer_full`; that is back-pressure working as designed.
 
 ### 2. Sensory Noise Filter Validation (Task 04, deprecated `/filter`)
 Evaluates classifier accuracy on synthetic mixed edge workloads (70% noise, 30% signal) and measures latency per chunk:
@@ -348,9 +375,9 @@ Evaluates classifier accuracy on synthetic mixed edge workloads (70% noise, 30% 
 ### 3. Multi-Rate Subsystem Stress Test (Task 05)
 Executes a 4-tier burst sweep (100, 500, 1,000, 5,000 req/s) of labelled log ingest with concurrent `/filter` calls, monitoring SoC temperatures and memory stability. By default it also drains and acks as a stand-in for Node 2; pass `-drain=false` to measure back-pressure instead:
 ```bash
-# On Node 3 (or from workstation pointing to Node 3):
+# From a workstation pointing to Node 3 (not on Node 3: see *Two cores per node*):
 ./bin/sekha-stress \
-  -base-url http://127.0.0.1:8081 \
+  -base-url http://192.168.8.183:8081 \
   -stage-duration 15s \
   -concurrency 32
 ```

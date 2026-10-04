@@ -15,6 +15,7 @@ import (
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/buffer"
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/config"
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/embed"
+	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/push"
 	"github.com/Duara-Cortex/sekha-sensory-buffer/internal/version"
 )
 
@@ -48,6 +49,21 @@ func main() {
 
 	server := api.NewServer(cfg, rb, embedder)
 
+	pushCtx, stopPush := context.WithCancel(context.Background())
+	pushDone := make(chan struct{})
+	if cfg.PushURL != "" {
+		p := &push.Pusher{
+			URL: cfg.PushURL, APIKey: cfg.PushAPIKey, Batch: cfg.PushBatch,
+			Interval: cfg.PushInterval, MaxBackoff: cfg.PushMaxBackoff,
+			Client: &http.Client{Timeout: cfg.PushTimeout}, Buf: rb, Logf: log.Printf,
+		}
+		go func() { p.Run(pushCtx); close(pushDone) }()
+		log.Printf("[Sekha Sensory Buffer] pushing chunks to %s in batches of %d; /drain and /ack are disabled", cfg.PushURL, cfg.PushBatch)
+	} else {
+		close(pushDone)
+		log.Printf("[Sekha Sensory Buffer] SEKHA_PUSH_URL not set: Node 2 must pull via /drain and /ack")
+	}
+
 	addr := fmt.Sprintf("%s:%d", *host, *port)
 	httpServer := &http.Server{
 		Addr:              addr,
@@ -70,6 +86,8 @@ func main() {
 	}()
 
 	sig := <-stopChan
+	stopPush()
+	<-pushDone
 	log.Printf("[Sekha Sensory Buffer] Received signal %v; initiating graceful shutdown (%d unacknowledged chunks will be lost)...", sig, rb.Pending())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
