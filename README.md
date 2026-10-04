@@ -147,15 +147,22 @@ Delivery is **at-least-once** to a **single consumer**, in one of two modes.
 
 #### Push mode (`SEKHA_PUSH_URL` set)
 
-Node 3 POSTs the oldest undelivered chunks to `SEKHA_PUSH_URL`, at most `SEKHA_PUSH_BATCH` per request. The body is the same JSON as a drain response:
+Node 3 POSTs the oldest undelivered chunks to Node 2's working-memory endpoint, `SEKHA_PUSH_URL=http://<node2-host>:<port>/api/v1/working/chunks`. Each request holds at most `SEKHA_PUSH_BATCH` chunks and `SEKHA_PUSH_MAX_BODY_BYTES` bytes (Node 2 accepts up to 8 MiB); a larger batch is split. The body is the same JSON as a drain response. Node 2 uses `epoch` and the chunk records and ignores the other fields:
 ```json
 {"epoch": "4f9c2a1b7e3d5a60", "chunks": [ /* chunk records, seq order */ ], "last_seq": 356, "pending": 1200, "more": true}
 ```
-- **Only `200` counts as received.** Node 3 then evicts every chunk in the batch and sends the next one right away. Node 2 must reply `200` only once the chunks are durably stored.
-- **Anything else keeps the batch:** another status (including `201`, `202` and `204`), a timeout after `SEKHA_PUSH_TIMEOUT_MS`, or no connection. Node 3 retries the same chunks after `SEKHA_PUSH_INTERVAL_MS`, doubling the delay after each failure up to `SEKHA_PUSH_MAX_BACKOFF_MS`. While Node 2 is down, new input fills the buffer and then gets `503 buffer_full`, as before.
-- **Duplicates are possible:** if a `200` is lost on the way back, the batch is sent again. De-duplicate on `(epoch, seq)`. A new `epoch` means Node 3 restarted and seqs restarted at 1.
+Every chunk has a `memory_id` and a `seq` above 0, and seqs increase within a batch and across batches of one epoch.
+
+| Node 2 reply | Node 3 does |
+| :--- | :--- |
+| `200 {"epoch", "accepted", "duplicates", "accepted_up_to_seq"}` | Evicts every chunk with `seq <= accepted_up_to_seq` and sends the next batch at once. Chunks above it are sent again. |
+| `503` + `Retry-After` | Keeps the chunks and resends the same batch after `Retry-After` seconds. |
+| `400` | Logs Node 2's message (a bug on Node 3's side) and keeps the chunks, retrying every `SEKHA_PUSH_MAX_BACKOFF_MS`. Ingest fills the buffer and then returns `503 buffer_full` until it is fixed. |
+| No reply, timeout (`SEKHA_PUSH_TIMEOUT_MS`), any other status, or a `200` without a valid `accepted_up_to_seq` for this epoch | Keeps the chunks and resends, after `SEKHA_PUSH_INTERVAL_MS` doubling up to `SEKHA_PUSH_MAX_BACKOFF_MS`. Node 2 skips seqs it already has. |
+
+- Nothing is evicted before Node 2 confirms it. A new `epoch` means Node 3 restarted, losing anything undelivered, and seqs restart at 1.
 - `Authorization: Bearer <SEKHA_PUSH_API_KEY>` is sent when the key is set.
-- The first failure and the recovery are each logged once, not every retry.
+- A failure is logged when it starts or changes kind, and once on recovery, not on every retry.
 - `GET /drain` and `POST /ack` return `409 push_mode`, so no second consumer can take chunks. `GET /buffer` still works for looking, but shows only undelivered chunks, since delivered ones are evicted at once. Run the stress and benchmark tools with `-drain=false` in this mode.
 
 #### Pull mode (`SEKHA_PUSH_URL` empty, the default)
@@ -220,11 +227,12 @@ All configuration is environment variables with built-in defaults. On Node 3 the
 | `SEKHA_HTTP_WRITE_TIMEOUT_S` | `120` | HTTP write timeout (ingest waits for embedding). |
 | `SEKHA_BACKPRESSURE_RETRY_AFTER_S` | `5` | `Retry-After` on `503 buffer_full`. |
 | `SEKHA_DRAIN_MAX_DEFAULT` / `SEKHA_DRAIN_MAX_LIMIT` | `256` / `4096` | Drain page size and its cap (pull mode). |
-| `SEKHA_PUSH_URL` | *(empty)* | Node 2's receive endpoint. Set it to turn on push mode; empty means pull mode. |
+| `SEKHA_PUSH_URL` | *(empty)* | Node 2's working-memory endpoint (`http://<node2-host>:<port>/api/v1/working/chunks`). Set it to turn on push mode; empty means pull mode. |
 | `SEKHA_PUSH_API_KEY` | *(empty)* | Bearer token sent to Node 2, if it needs one. Never logged. |
 | `SEKHA_PUSH_BATCH` | `256` | Chunks per POST. |
+| `SEKHA_PUSH_MAX_BODY_BYTES` | `8388608` | Largest request body; a bigger batch is split (Node 2's limit is 8 MiB). |
 | `SEKHA_PUSH_INTERVAL_MS` | `1000` | Wait when the buffer is empty, and the first retry delay. |
-| `SEKHA_PUSH_MAX_BACKOFF_MS` | `30000` | Cap on the doubling retry delay. |
+| `SEKHA_PUSH_MAX_BACKOFF_MS` | `30000` | Cap on the doubling retry delay, and the retry delay after a `400`. A `503` waits for Node 2's `Retry-After` instead. |
 | `SEKHA_PUSH_TIMEOUT_MS` | `10000` | Per-POST timeout; a timeout is a failure and the batch is resent. |
 | `SEKHA_CHUNK_MAX_BYTES` | `1024` | Chunk size limit (~250 tokens, inside MiniLM's window). |
 | `SEKHA_FLOOR_SEPARATOR_PATTERN` | see `.env.example` | Separator-line regex (RE2). |

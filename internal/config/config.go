@@ -53,6 +53,7 @@ const (
 	DefaultPushIntervalMS        = 1000
 	DefaultPushMaxBackoffMS      = 30000
 	DefaultPushTimeoutMS         = 10000
+	DefaultPushMaxBodyBytes      = 8 << 20 // Node 2's request limit
 )
 
 // Config is the fully resolved service configuration.
@@ -93,6 +94,7 @@ type Config struct {
 	PushInterval   time.Duration
 	PushMaxBackoff time.Duration
 	PushTimeout    time.Duration
+	PushMaxBody    int
 }
 
 // LookupFunc matches os.LookupEnv.
@@ -218,6 +220,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		PushInterval:   time.Duration(l.intVal("SEKHA_PUSH_INTERVAL_MS", DefaultPushIntervalMS, 10)) * time.Millisecond,
 		PushMaxBackoff: time.Duration(l.intVal("SEKHA_PUSH_MAX_BACKOFF_MS", DefaultPushMaxBackoffMS, 10)) * time.Millisecond,
 		PushTimeout:    time.Duration(l.intVal("SEKHA_PUSH_TIMEOUT_MS", DefaultPushTimeoutMS, 1)) * time.Millisecond,
+		PushMaxBody:    l.intVal("SEKHA_PUSH_MAX_BODY_BYTES", DefaultPushMaxBodyBytes, 4096),
 	}
 
 	if c.EmbedProvider != ProviderOpenAI && c.EmbedProvider != ProviderNone {
