@@ -16,7 +16,7 @@ func TestDefaults(t *testing.T) {
 		c.EmbedURL != "http://127.0.0.1:8086/v1/embeddings" || c.EmbedTimeout != 10*time.Second ||
 		!c.HeartbeatTypes[TypeLog] || c.HeartbeatTypes[TypeDialogue] || !c.DedupTypes[TypeDialogue] ||
 		c.LegacyFilterThreshold != 0.75 || c.EmbedAPIKey != "" || c.PushURL != "" || c.PushBatch != 256 ||
-		c.PushInterval != time.Second || c.PushMaxBackoff != 30*time.Second || c.PushTimeout != 10*time.Second {
+		c.PushInterval != time.Second || c.PushMaxBackoff != 30*time.Second || c.PushTimeout != 10*time.Second || c.PushMaxBody != 8<<20 {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 }

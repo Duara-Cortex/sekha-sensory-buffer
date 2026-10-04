@@ -53,7 +53,7 @@ func main() {
 	pushDone := make(chan struct{})
 	if cfg.PushURL != "" {
 		p := &push.Pusher{
-			URL: cfg.PushURL, APIKey: cfg.PushAPIKey, Batch: cfg.PushBatch,
+			URL: cfg.PushURL, APIKey: cfg.PushAPIKey, Batch: cfg.PushBatch, MaxBodyBytes: cfg.PushMaxBody,
 			Interval: cfg.PushInterval, MaxBackoff: cfg.PushMaxBackoff,
 			Client: &http.Client{Timeout: cfg.PushTimeout}, Buf: rb, Logf: log.Printf,
 		}
