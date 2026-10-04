@@ -45,6 +45,25 @@ func TestAppendAssignsContiguousSeqsAndTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	}
+	r := rec("hello")
+	unscored := r.size()
+	s := 0.5
+	r.TaskScore = &s
+	if r.size() <= unscored {
+		t.Fatal("a task score must add to the accounted size")
+	}
+	if unscored < OverheadPerChunk+int64(len("hello")) {
+		t.Fatalf("size %d does not include the text", unscored)
+	}
+}
+
+func TestAppendAssignsContiguousSeqsAndTimestamps(t *testing.T) {
+	rb := New(1024 * 1024)
+	out, err := rb.Append(recs(3, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i, r := range out {
 		if r.Seq != uint64(i+1) || r.TS.IsZero() {
 			t.Fatalf("record %d: seq=%d ts=%v", i, r.Seq, r.TS)
@@ -82,6 +101,21 @@ func TestBackPressureNeverEvictsUnacknowledged(t *testing.T) {
 	if st.CurrentItemCount != 10 || st.PendingCount != 10 || st.EvictedAckedCount != 0 || st.DroppedPackets != 0 || st.BackpressureCount != 5 {
 		t.Fatalf("buffer changed under back-pressure: %+v", st)
 	}
+	}
+	for i := 0; i < 5; i++ {
+		_, err := rb.Append([]Record{rec(strings.Repeat("b", 100))})
+		var full *FullError
+		if !errors.As(err, &full) {
+			t.Fatalf("overflow append %d: want *FullError, got %v", i, err)
+		}
+		if full.PendingChunks != 10 {
+			t.Fatalf("pending in error = %d, want 10", full.PendingChunks)
+		}
+	}
+	st := rb.Stats()
+	if st.CurrentItemCount != 10 || st.PendingCount != 10 || st.EvictedAckedCount != 0 || st.DroppedPackets != 0 || st.BackpressureCount != 5 {
+		t.Fatalf("buffer changed under back-pressure: %+v", st)
+	}
 	got := rb.Drain(0, 100)
 	if len(got.Chunks) != 10 || got.Chunks[0].Seq != 1 || got.Chunks[9].Seq != 10 {
 		t.Fatalf("original records not intact: %d chunks", len(got.Chunks))
@@ -93,6 +127,14 @@ func TestAppendIsAllOrNothing(t *testing.T) {
 	rb := New(one.size() * 4)
 	if _, err := rb.Append(recs(3, 97)); err != nil {
 		t.Fatal(err)
+	}
+	// Two more do not fit; neither may be stored.
+	if _, err := rb.Append(recs(2, 97)); err == nil {
+		t.Fatal("expected back-pressure")
+	}
+	if n := rb.Stats().CurrentItemCount; n != 3 {
+		t.Fatalf("partial append stored: %d items", n)
+	}
 	}
 	// Two more do not fit; neither may be stored.
 	if _, err := rb.Append(recs(2, 97)); err == nil {
@@ -132,6 +174,18 @@ func TestAckMakesSpaceAndOnlyAckedAreEvicted(t *testing.T) {
 	out, err := rb.Append(recs(2, 96))
 	if err != nil {
 		t.Fatalf("append after ack: %v", err)
+	}
+	if out[0].Seq != 5 || out[1].Seq != 6 {
+		t.Fatalf("seqs %d,%d", out[0].Seq, out[1].Seq)
+	}
+	st := rb.Stats()
+	if st.EvictedAckedCount != 2 || st.PendingCount != 4 || st.DroppedPackets != 0 {
+		t.Fatalf("unexpected stats %+v", st)
+	}
+	d := rb.Drain(0, 10)
+	if len(d.Chunks) != 4 || d.Chunks[0].Seq != 3 {
+		t.Fatalf("unacked records lost: %+v", d)
+	}
 	}
 	if out[0].Seq != 5 || out[1].Seq != 6 {
 		t.Fatalf("seqs %d,%d", out[0].Seq, out[1].Seq)
@@ -190,6 +244,35 @@ func TestAckErrors(t *testing.T) {
 	}
 	if n, err := rb.Ack(rb.Epoch(), 2); n != 0 || err != nil {
 		t.Fatalf("re-ack of older seq should be a no-op, got n=%d err=%v", n, err)
+	}
+}
+
+func TestEpochDiffersPerInstance(t *testing.T) {
+	if New(1024).Epoch() == New(1024).Epoch() {
+		t.Fatal("epochs must differ between buffer instances")
+	}
+}
+
+func TestEvictAckedRemovesOnlyAcknowledged(t *testing.T) {
+	rb := New(1024 * 1024)
+	if _, err := rb.Append(recs(5, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rb.Ack(rb.Epoch(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if n := rb.EvictAcked(); n != 3 {
+		t.Fatalf("evicted %d, want 3", n)
+	}
+	st := rb.Stats()
+	if st.CurrentItemCount != 2 || st.PendingCount != 2 || st.AckedRetainedCount != 0 || st.EvictedAckedCount != 3 {
+		t.Fatalf("unexpected stats %+v", st)
+	}
+	if got := rb.Drain(0, 10).Chunks; len(got) != 2 || got[0].Seq != 4 {
+		t.Fatalf("drain after evict = %+v", got)
+	}
+	if n := rb.EvictAcked(); n != 0 {
+		t.Fatalf("second evict removed %d", n)
 	}
 }
 

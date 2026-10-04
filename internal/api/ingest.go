@@ -456,6 +456,9 @@ func newMemoryID() string {
 
 // handleDrain implements GET /api/v1/sensory/drain: the oldest unacknowledged records.
 func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	if s.rejectInPushMode(w) {
+		return
+	}
 	q := r.URL.Query()
 	max := s.Cfg.DrainMaxDefault
 	if v := q.Get("max"); v != "" {
@@ -481,6 +484,17 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.RingBuffer.Drain(after, max))
 }
 
+// rejectInPushMode refuses /drain and /ack while the push loop delivers to Node 2: a
+// second consumer pulling and acking would take chunks the push loop has not sent.
+func (s *Server) rejectInPushMode(w http.ResponseWriter) bool {
+	if s.Cfg.PushURL == "" {
+		return false
+	}
+	writeError(w, &apiError{status: http.StatusConflict, Code: "push_mode",
+		Message: "Node 3 pushes chunks to Node 2 (SEKHA_PUSH_URL is set); /drain and /ack are disabled"})
+	return true
+}
+
 // AckRequest is the body of POST /api/v1/sensory/ack.
 type AckRequest struct {
 	Epoch   string  `json:"epoch"`
@@ -489,6 +503,9 @@ type AckRequest struct {
 
 // handleAck implements POST /api/v1/sensory/ack: cumulative acknowledgement.
 func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
+	if s.rejectInPushMode(w) {
+		return
+	}
 	var req AckRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	dec.DisallowUnknownFields()

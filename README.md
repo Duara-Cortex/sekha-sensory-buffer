@@ -318,6 +318,7 @@ sudo install -d -m 0755 /etc/sekha
 test -f /etc/sekha/sensory-buffer.env || sudo install -m 0600 /tmp/.env.example /etc/sekha/sensory-buffer.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now sekha-sensory-buffer.service
+sudo systemctl try-restart sekha-sensory-buffer.service sekha-embed.service   # pick up new units
 ```
 
 ---
@@ -348,9 +349,9 @@ Evaluates classifier accuracy on synthetic mixed edge workloads (70% noise, 30% 
 ### 3. Multi-Rate Subsystem Stress Test (Task 05)
 Executes a 4-tier burst sweep (100, 500, 1,000, 5,000 req/s) of labelled log ingest with concurrent `/filter` calls, monitoring SoC temperatures and memory stability. By default it also drains and acks as a stand-in for Node 2; pass `-drain=false` to measure back-pressure instead:
 ```bash
-# On Node 3 (or from workstation pointing to Node 3):
+# From a workstation pointing to Node 3 (not on Node 3: see *Two cores per node*):
 ./bin/sekha-stress \
-  -base-url http://127.0.0.1:8081 \
+  -base-url http://192.168.8.183:8081 \
   -stage-duration 15s \
   -concurrency 32
 ```

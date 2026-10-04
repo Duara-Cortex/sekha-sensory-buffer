@@ -289,6 +289,16 @@ func (rb *RingBuffer) evictOldestAckedLocked() {
 	if cap(rb.items) > 1024 && len(rb.items) < cap(rb.items)/4 {
 		rb.items = append(make([]entry, 0, len(rb.items)*2), rb.items...)
 	}
+	}
+	head := rb.items[0]
+	rb.items[0] = entry{}
+	rb.items = rb.items[1:]
+	rb.ackedCount--
+	rb.usedBytes -= head.size
+	rb.evictedAcked++
+	if cap(rb.items) > 1024 && len(rb.items) < cap(rb.items)/4 {
+		rb.items = append(make([]entry, 0, len(rb.items)*2), rb.items...)
+	}
 }
 
 // DrainResult is a page of unacknowledged records.
@@ -349,6 +359,36 @@ func (rb *RingBuffer) Ack(epoch string, upTo uint64) (int, error) {
 	rb.ackedCount += n
 	rb.ackedUpTo = upTo
 	return n, nil
+
+	if epoch != rb.epoch {
+		return 0, ErrEpochMismatch
+	}
+	if upTo >= rb.nextSeq {
+		return 0, ErrAckAhead
+	}
+	if upTo <= rb.ackedUpTo {
+		return 0, nil
+	}
+	n := 0
+	for i := rb.ackedCount; i < len(rb.items) && rb.items[i].rec.Seq <= upTo; i++ {
+		n++
+	}
+	rb.ackedCount += n
+	rb.ackedUpTo = upTo
+	return n, nil
+}
+
+// EvictAcked removes every acknowledged record now instead of waiting until its space is
+// needed, and returns how many were removed. The push loop calls it once Node 2 has taken
+// a batch, so delivered chunks leave RAM straight away.
+func (rb *RingBuffer) EvictAcked() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	n := rb.ackedCount
+	for rb.ackedCount > 0 {
+		rb.evictOldestAckedLocked()
+	}
+	return n
 }
 
 // Pending returns the number of unacknowledged records.
