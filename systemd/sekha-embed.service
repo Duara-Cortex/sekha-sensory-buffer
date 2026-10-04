@@ -17,6 +17,11 @@ ExecStart=/bin/sh -c 'exec "${SEKHA_EMBED_SERVER_BIN}" -m "${SEKHA_EMBED_MODEL_P
 Restart=always
 RestartSec=3s
 
+# Node CPU cap: no Sekha node may use more than 2 threads (more took Node 3 down on
+# 2026-09-29). Both Sekha units are pinned to the same two cores, so ingest and embedding
+# together never use more than 2.
+CPUAffinity=0 1
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sekha-embed

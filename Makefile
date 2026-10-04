@@ -36,6 +36,7 @@ install:
 	@test -f /etc/sekha/sensory-buffer.env || { install -m 0600 .env.example /etc/sekha/sensory-buffer.env; echo "Created /etc/sekha/sensory-buffer.env from .env.example"; }
 	systemctl daemon-reload
 	systemctl restart sekha-sensory-buffer.service
+	systemctl try-restart sekha-embed.service
 	@echo "Daemon updated and restarted: sekha-sensory-buffer.service"
 	@echo "Embedding server unit installed; enable once the model is in place: sudo systemctl enable --now sekha-embed.service"
 
@@ -45,11 +46,14 @@ test:
 validate:
 	./bin/$(VALIDATE_NAME)
 
+# Load tools: run from a workstation, not on Node 3 (the node is capped at 2 cores).
+NODE3_URL=http://$(NODE3_HOST):8081
+
 stress:
-	./bin/$(STRESS_NAME) -base-url http://127.0.0.1:8081 -stage-duration 15s
+	./bin/$(STRESS_NAME) -base-url $(NODE3_URL) -stage-duration 15s
 
 bench:
-	./bin/$(BENCHMARK_NAME) -url http://127.0.0.1:8081/api/v1/sensory/ingest -stats-url http://127.0.0.1:8081/api/v1/sensory/stats -lines-per-sec 10000 -duration 10s -batch-size 50
+	./bin/$(BENCHMARK_NAME) -url $(NODE3_URL)/api/v1/sensory/ingest -stats-url $(NODE3_URL)/api/v1/sensory/stats -lines-per-sec 10000 -duration 10s -batch-size 50
 
 run:
 	go run ./cmd/server -port 8081 -capacity-mb 64

@@ -351,6 +351,19 @@ func (rb *RingBuffer) Ack(epoch string, upTo uint64) (int, error) {
 	return n, nil
 }
 
+// EvictAcked removes every acknowledged record now instead of waiting until its space is
+// needed, and returns how many were removed. The push loop calls it once Node 2 has taken
+// a batch, so delivered chunks leave RAM straight away.
+func (rb *RingBuffer) EvictAcked() int {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	n := rb.ackedCount
+	for rb.ackedCount > 0 {
+		rb.evictOldestAckedLocked()
+	}
+	return n
+}
+
 // Pending returns the number of unacknowledged records.
 func (rb *RingBuffer) Pending() int {
 	rb.mu.RLock()

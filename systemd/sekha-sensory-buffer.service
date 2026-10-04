@@ -17,6 +17,21 @@ RestartSec=3s
 
 # Resource and sandbox controls
 LimitNOFILE=65535
+# Node CPU cap: no Sekha node may use more than 2 threads (more took Node 3 down on
+# 2026-09-29). Both Sekha units are pinned to the same two cores, so ingest and embedding
+# together never use more than 2.
+CPUAffinity=0 1
+Environment=GOMAXPROCS=2
+# Memory cap, so a runaway process is killed and restarted instead of freezing the node.
+# The buffer is RAM only: a kill loses every chunk not yet delivered. The default
+# SEKHA_CAPACITY_MB=64 measured ~300 MiB RSS. If you raise the budget, keep MemoryMax at
+# about 3 x SEKHA_CAPACITY_MB + 300M, with MemoryHigh and GOMEMLIMIT below it.
+MemoryHigh=400M
+MemoryMax=512M
+# Makes Go collect garbage harder before reaching MemoryHigh (and works even where the
+# memory cgroup controller is off). Keep it below MemoryHigh.
+Environment=GOMEMLIMIT=350MiB
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sekha-sensory-buffer

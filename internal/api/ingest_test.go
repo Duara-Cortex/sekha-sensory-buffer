@@ -459,6 +459,21 @@ func TestIngestPayloadTooLarge(t *testing.T) {
 	decodeError(t, do(t, srv, http.MethodPost, "/api/v1/sensory/ingest", "application/json", body), http.StatusRequestEntityTooLarge)
 }
 
+// In push mode Node 3 is the only sender, so pulling and acking are refused.
+func TestDrainAndAckDisabledInPushMode(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.PushURL = "http://node2.test/receive"
+	srv := NewServer(cfg, buffer.New(1<<20), embed.None{})
+	for _, req := range []struct{ method, path, body string }{
+		{http.MethodGet, "/api/v1/sensory/drain", ""},
+		{http.MethodPost, "/api/v1/sensory/ack", `{"epoch":"x","up_to_seq":1}`},
+	} {
+		if e := decodeError(t, do(t, srv, req.method, req.path, "application/json", []byte(req.body)), http.StatusConflict); e.Code != "push_mode" {
+			t.Fatalf("%s: got %+v", req.path, e)
+		}
+	}
+}
+
 func TestMemoryIDsAreUniqueUUIDv7(t *testing.T) {
 	a, b := newMemoryID(), newMemoryID()
 	if a == b || len(a) != 36 || a[14] != '7' {

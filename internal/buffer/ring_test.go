@@ -193,6 +193,29 @@ func TestAckErrors(t *testing.T) {
 	}
 }
 
+func TestEvictAckedRemovesOnlyAcknowledged(t *testing.T) {
+	rb := New(1024 * 1024)
+	if _, err := rb.Append(recs(5, 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rb.Ack(rb.Epoch(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if n := rb.EvictAcked(); n != 3 {
+		t.Fatalf("evicted %d, want 3", n)
+	}
+	st := rb.Stats()
+	if st.CurrentItemCount != 2 || st.PendingCount != 2 || st.AckedRetainedCount != 0 || st.EvictedAckedCount != 3 {
+		t.Fatalf("unexpected stats %+v", st)
+	}
+	if got := rb.Drain(0, 10).Chunks; len(got) != 2 || got[0].Seq != 4 {
+		t.Fatalf("drain after evict = %+v", got)
+	}
+	if n := rb.EvictAcked(); n != 0 {
+		t.Fatalf("second evict removed %d", n)
+	}
+}
+
 func TestEpochDiffersPerInstance(t *testing.T) {
 	if New(1024).Epoch() == New(1024).Epoch() {
 		t.Fatal("epochs must differ between buffer instances")
